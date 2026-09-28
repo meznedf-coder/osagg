@@ -1,0 +1,9 @@
+.venv/
+.work/
+__pycache__/
+*.pyc
+*.parquet
+dist/
+build/
+*.egg-info/
+lab/out/

@@ -1,0 +1,15 @@
+[Unit]
+Description=Superset MCP service (AI agents -> Superset), localhost only
+After=network.target
+
+[Service]
+# edit: the account and paths of your Superset installation
+User=superset
+Environment=SUPERSET_CONFIG_PATH=/etc/superset/superset_config.py
+Environment=FLASK_APP=superset
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/superset/venv/bin/superset mcp run --host 127.0.0.1 --port 5008
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

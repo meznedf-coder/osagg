@@ -1,0 +1,67 @@
+osagg 0.2.6 + promagg 0.1.0 bundle - Superset + OpenSearch and Prometheus / Mimir pushdown,
+MCP services, AI agent, e-mail reports
+Linux x86-64, Superset 6.1 (osagg alone also works on 6.0 / 5.0), Python 3.11. pip only.
+
+What changed since 0.2.2: CHANGES.md. Full runbook: DEPLOY.md (same folder).
+Received in two parts (part1-core, part2-mcp)? Extract both in the same directory.
+
+The Python of Superset:   head -1 "$(command -v superset)"
+e.g. #!/opt/superset/venv/bin/python3.11  ->  PY=/opt/superset/venv/bin/python3.11
+Run everything as the user that owns that virtualenv.
+
+A. osagg + promagg (required) ---------------------------------------------------
+  A1. ./install.sh $PY                       (offline; upgrades an older osagg too)
+  A2. nothing in superset_config.py
+  A3. restart the web server, the Celery workers and Celery beat
+  New connection: Settings > Database Connections > + Database > "OpenSearch
+  (aggregation pushdown)" > URI (DEPLOY.md step 4). Existing connections keep working.
+
+B. MCP services + AI agent (optional, Superset 6.1) ------------------------------
+  B1. ./install.sh $PY --mcp                 (adds fastmcp and its packages; pip check clean)
+  B2. add config/superset_config_mcp.py to superset_config.py (4 settings), create the
+      Superset user it names (e.g. mcp_agent, role Gamma + the datasets it may use)
+  B3. Superset's MCP service: systemd/superset-mcp.service (edit the paths), then
+        sudo cp systemd/superset-mcp.service /etc/systemd/system/
+        sudo systemctl daemon-reload && sudo systemctl enable --now superset-mcp
+      -> http://127.0.0.1:5008/mcp
+  B4. the tools service (data dictionary, Excel extracts, chart images, e-mails, reports):
+        sudo mkdir -p /opt/superset/ai /srv/superset-exports && sudo cp ai/* /opt/superset/ai/
+        fill /opt/superset/ai/tools.env (chmod 600), edit /opt/superset/ai/catalog.yaml
+        (index names as in Superset, field descriptions, relationships, glossary)
+        sudo cp systemd/superset-tools.service /etc/systemd/system/   (edit the paths)
+        sudo systemctl daemon-reload && sudo systemctl enable --now superset-tools
+      -> http://127.0.0.1:5009/mcp. Descriptions into the Superset datasets (UI + MCP):
+        set -a; . /opt/superset/ai/tools.env; set +a
+        $PY /opt/superset/ai/superset_tools_mcp.py push-descriptions
+      Chart images need the headless Chromium of part C on this host too.
+  B5. the agent: fill /opt/superset/ai/agent.env (LLM URL, account; chmod 600), then
+        set -a; . /opt/superset/ai/agent.env; set +a
+        $PY /opt/superset/ai/superset_agent.py "Report of the failing jobs today by application"
+      (no question: interactive). Ask for a table (default), JSON, an Excel extract, a
+      chart image or an e-mail. It validates chart configs before Superset's MCP service
+      sees them (no duplicate or broken charts, see DEPLOY.md section 10).
+  B6. optional: saved metrics the agent can use for ratios / percentiles / failed counts
+        $PY /opt/superset/ai/add_saved_metrics.py <dataset id>     (same agent.env)
+
+C. Scheduled e-mail reports with screenshots (optional) ---------------------------
+  C1. add config/superset_config_reports.py to superset_config.py (SMTP relay, executor
+      user, headless Chrome settings); the tools service sends its e-mails with them too
+  C2. Chromium + chromedriver on every Celery worker host and on the host of the tools
+      service (DEPLOY.md section 11)
+  C3. restart the workers and beat; Alerts & Reports > + Report, or ask the agent
+      ("schedule an e-mail report of dashboard X every weekday at 8:00 to ...")
+
+D. Prometheus / Mimir metrics (promagg, installed by A1) --------------------------
+  D1. New connection: + Database > "Prometheus / Mimir (PromQL pushdown)" > URI, e.g.
+        promagg+https://<user>:<password>@<mimir>:443/prometheus?tenant=<tenant>&timezone=Europe/Paris
+      (options and the Mimir read account: DEPLOY.md section 12; SQL: promagg-README.md)
+      Several tenants: tenant=team-a|team-b (Mimir tenant federation, DEPLOY.md section 12).
+  D2. Describe the metrics in ai/catalog.yaml (section "metrics": descriptions, label meanings,
+      how labels match index fields, saved metrics; section "checks": health checks), then
+        set -a; . /opt/superset/ai/tools.env; set +a
+        $PY /opt/superset/ai/superset_tools_mcp.py push-metrics     (datasets + saved metrics)
+        sudo systemctl restart superset-tools
+  D3. The agent now answers metric questions and investigations ("did the servers of the
+      failed jobs have resource problems?") with promql_query, check_health, list_alerts.
+
+Superset 5.0: add "opensearch-py==2.6.0" to the pip command of A1 (see DEPLOY.md).

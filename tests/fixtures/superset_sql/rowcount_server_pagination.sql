@@ -1,0 +1,5 @@
+SELECT COUNT(*) AS rowcount 
+FROM (SELECT "APPLICATION" AS "APPLICATION", "NODE" AS "NODE", COUNT(*) AS count 
+FROM "default"."jobs" 
+WHERE "@timestamp_date" >= TIMESTAMP '2026-03-25 00:00:00.000000' AND "@timestamp_date" < TIMESTAMP '2026-04-02 00:00:00.000000' GROUP BY "APPLICATION", "NODE" 
+ LIMIT 100) AS rowcount_qry;

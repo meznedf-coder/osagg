@@ -1,0 +1,173 @@
+# Catalog of the tools service (superset_tools_mcp.py, CATALOG in tools.env): what people know
+# about the data. describe_data serves it to the agent with the profile learned from the data;
+# `push-descriptions` copies the descriptions into the dataset columns. The same format is
+# imported by supagent (superset supagent import-catalog catalog.yaml).
+#
+# An example to adapt: a batch-jobs index in OpenSearch (read through osagg), a small lookup
+# index of applications, and server / scheduler metrics in Prometheus or Mimir (read through
+# promagg). Keys under "indices" are the table names in Superset (index, alias or pattern).
+# Values, ranges, document counts, series and time ranges are learned every day and do not
+# need to be written here.
+
+glossary:
+  failed job: STATUS_INFO = 'FAILED'. Failure rate % = failed jobs * 100 / all jobs.
+  position date / business date: POSITION_DATE (yyyymmdd), the business day a job computes, not the day it runs.
+  POSITION_LABEL: D, D-1, D-2... (business days before the session date), W-1, W-2... (same weekday 1, 2... weeks before), Y-1. Before 14:00 the session date is the previous business day. Filter with POSITION_LABEL IN ('D-1', 'W-1').
+  POSITION_TIME: execution time moved onto the D-1 position date, to overlay several position dates on one time axis (X axis POSITION_TIME, one line per POSITION_LABEL).
+  today / yesterday: for executions use "@timestamp_date"; for business days use POSITION_LABEL = 'D' / 'D-1'.
+  cost: CPU_COST_H_d, CPU hours used by the run.
+
+indices:
+  batch-jobs:
+    description: >
+      Batch job executions, one document per run: application and environment, where it ran
+      (node, pool), status and error details, duration and cost, and the business (position)
+      date it computes.
+    time_field: "@timestamp_date"
+    relationships:
+      - to: applications
+        keys: {APPLICATION: APPLICATION, ENVIRONMENT_TYPE: ENVIRONMENT_TYPE}
+        description: team and tier of the application in that environment
+    fields:
+      "@timestamp_date":
+        label: "Execution time"
+        description: "When the job ran (start of the execution), local time."
+        synonyms: [time, date, execution date, run time, when]
+      APPLICATION:
+        label: "Application"
+        description: "Application that owns the job (BILLING, PAYROLL, ORDERS...)"
+        synonyms: [app, application name, system]
+      ENVIRONMENT_TYPE:
+        label: "Environment"
+        description: "Environment of the run: DEV, UAT or PROD"
+        synonyms: [env, environment]
+      STATUS_INFO:
+        label: "Status"
+        description: "Final status of the run: SUCCESS, FAILED, KILLED, RUNNING..."
+        synonyms: [state, result, outcome, failing, failed, success]
+      ERROR_CATEGORY:
+        label: "Error category"
+        description: "Family of the error of a failed run (CONFIG, DATA, DEPENDENCY, TIMEOUT...)"
+        synonyms: [error type, failure reason, cause]
+      ERROR_DESCRIPTION:
+        label: "Error description"
+        description: "Error message of the run (which step failed, on which node)"
+        synonyms: [error message, message]
+      JOB_DURATION_d:
+        label: "Duration (s)"
+        unit: "seconds"
+        description: "Duration of the run"
+        synonyms: [duration, run time, elapsed, how long, latency]
+      CPU_COST_H_d:
+        label: "CPU cost (h)"
+        unit: "CPU hours"
+        description: "CPU hours used by the run"
+        synonyms: [cost, cpu, compute]
+      NODE:
+        label: "Node"
+        description: "Server that ran the job"
+        synonyms: [server, host, machine]
+      POOL:
+        label: "Pool"
+        description: "Execution pool / queue of the job"
+      POSITION_DATE:
+        label: "Position date"
+        description: "Business date the job computes (yyyymmdd)"
+        synonyms: [business date, cob date, position]
+      SEVERITY:
+        label: "Severity"
+        description: "Business importance of the job: LOW, MEDIUM, HIGH, CRITICAL"
+        synonyms: [criticality, importance]
+
+  applications:
+    description: Applications per environment with their owning team and service tier (small lookup index).
+    fields:
+      APPLICATION: {description: "Application name (same values as the jobs' APPLICATION)"}
+      ENVIRONMENT_TYPE: {description: "DEV, UAT or PROD"}
+      TEAM: {description: "Team that owns the application", synonyms: [owner, squad]}
+      TIER: {description: "Service tier: 1 (most critical) to 3", synonyms: [criticality, service level]}
+
+metrics:
+  database: "Prometheus (promagg)"
+  description: >
+    Prometheus metrics (Prometheus or Grafana Mimir): the servers (node_exporter: CPU, memory,
+    disks, availability), the job scheduler (jobs by status, job durations) and the HTTP APIs.
+  label_relationships:
+    - {label: node, index: batch-jobs, field: NODE, description: "server that ran the job"}
+    - {label: application, index: batch-jobs, field: APPLICATION, description: "application of the job"}
+    - {label: env, index: batch-jobs, field: ENVIRONMENT_TYPE, description: "PROD, UAT or DEV"}
+    - {label: pool, index: batch-jobs, field: POOL, description: "execution pool of the job"}
+  tables:
+    node_cpu_seconds_total:
+      description: "CPU time spent per CPU and mode (counter); mode idle = unused, the other modes = busy"
+      unit: seconds
+      synonyms: [cpu, processor, busy, saturation, usage, saturated]
+      labels: {mode: "idle, user, system, iowait...", cpu: "CPU number", node: "server"}
+      sql:
+        - "CPU busy % per server: SELECT DATE_TRUNC('hour', ts) t, node, 100 * SUM(rate) FILTER (WHERE mode <> 'idle') / SUM(rate) AS cpu_busy_pct FROM node_cpu_seconds_total WHERE ts >= TIMESTAMP '...' AND ts < TIMESTAMP '...' GROUP BY 1, 2"
+      saved_metrics:
+        cpu_busy_pct: {sql: "100 * SUM(rate) FILTER (WHERE mode <> 'idle') / SUM(rate)", description: "CPU busy % (share of CPU time not idle)", label: "CPU busy %"}
+    node_memory_MemAvailable_bytes:
+      description: "Memory available for new work on the server"
+      unit: bytes
+      synonyms: [memory, ram, free memory, available memory]
+      saved_metrics:
+        mem_available_gib_min: {sql: "MIN(value) / 1073741824", description: "Lowest available memory (GiB)", label: "Min available memory (GiB)"}
+    node_memory_MemTotal_bytes: {description: "Total memory of the server", unit: bytes, synonyms: [memory, ram]}
+    node_filesystem_avail_bytes:
+      description: "Free disk space per mount point"
+      unit: bytes
+      synonyms: [disk, filesystem, space, full, storage]
+    node_filesystem_size_bytes: {description: "Size of each file system", unit: bytes, synonyms: [disk, space]}
+    up:
+      description: "1 when the exporter of a server answers, 0 when it does not (server down or unreachable)"
+      synonyms: [down, availability, reachable, alive]
+    batch_jobs_total:
+      description: "Jobs finished per application, environment and status (counter, from the scheduler)"
+      synonyms: [jobs, failures, failed, status]
+      labels: {application: "application of the job", env: "PROD, UAT or DEV", status: "SUCCESS, FAILED..."}
+      saved_metrics:
+        jobs_finished: {sql: "SUM(increase)", description: "Jobs finished", label: "Jobs"}
+    batch_job_duration_seconds_bucket:
+      description: "Histogram of the job durations per application (seconds)"
+      unit: seconds
+      synonyms: [duration, latency, p95, percentile]
+    http_requests_total:
+      description: "HTTP requests per application and status code (counter)"
+      synonyms: [requests, http, errors, 5xx]
+
+checks:
+  cpu_saturation:
+    description: "CPU busy above 90 % on a server for 10 minutes or more"
+    promql: '100 * (1 - avg by (node) (rate(node_cpu_seconds_total{mode="idle"}[5m])))'
+    above: 90
+    for: 10m
+    unit: " %"
+  memory_pressure:
+    description: "Less than 5 % of the memory available on a server"
+    promql: '100 * node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes'
+    below: 5
+    for: 5m
+    unit: " %"
+  disk_full:
+    description: "Less than 5 % free on a data file system"
+    promql: '100 * node_filesystem_avail_bytes{mountpoint="/data"} / node_filesystem_size_bytes{mountpoint="/data"}'
+    below: 5
+    for: 10m
+    unit: " %"
+  server_down:
+    description: "Server exporter not answering (server down, rebooting or unreachable)"
+    promql: 'up{job="node"}'
+    below: 1
+  http_5xx_ratio:
+    description: "More than 5 % of the HTTP requests of an application answered 5xx"
+    promql: '100 * sum by (application) (rate(http_requests_total{code=~"5.."}[5m])) / sum by (application) (rate(http_requests_total[5m]))'
+    above: 5
+    for: 5m
+    unit: " %"
+  job_failure_rate:
+    description: "More than 20 % of the jobs of an application failing"
+    promql: '100 * sum by (application) (increase(batch_jobs_total{status="FAILED"}[15m])) / sum by (application) (increase(batch_jobs_total[15m]))'
+    above: 20
+    for: 15m
+    unit: " %"

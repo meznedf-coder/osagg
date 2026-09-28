@@ -1,0 +1,5 @@
+SELECT TIME_BUCKET(INTERVAL '10 minutes', "@timestamp_date") AS "@timestamp_date", "APPLICATION" AS "APPLICATION", COUNT(*) AS count 
+FROM (SELECT * FROM "jobs" WHERE "APPLICATION" IN ('BILLING', 'PAYROLL', 'ORDERS', 'ORDERS_REPORT', 'ANALYTICS', 'INVOICING')
+) AS virtual_table 
+WHERE "@timestamp_date" >= TIMESTAMP '2026-03-25 00:00:00.000000' AND "@timestamp_date" < TIMESTAMP '2026-04-02 00:00:00.000000' GROUP BY TIME_BUCKET(INTERVAL '10 minutes', "@timestamp_date"), "APPLICATION" 
+ LIMIT 50000;

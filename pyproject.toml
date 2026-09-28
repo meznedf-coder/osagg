@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "osagg"
+version = "0.2.6"
+description = "OpenSearch aggregation-pushdown SQL engine for Apache Superset (DB-API + SQLAlchemy + engine spec)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "sqlglot>=26",
+    "duckdb>=1.1",
+    "pyarrow>=14",
+    "opensearch-py>=2.4,<3.1",   # 3.1+ pulls grpcio + protobuf (not needed)
+    "sqlalchemy>=1.4,<3",
+]
+
+[project.optional-dependencies]
+trino = ["trino>=0.330"]
+test = ["pytest>=8", "pandas"]
+
+[project.entry-points."sqlalchemy.dialects"]
+osagg = "osagg.sqla:OpenSearchAggDialect"
+"osagg.rest" = "osagg.sqla:OpenSearchAggDialect"
+"osagg.https" = "osagg.sqla:OpenSearchAggHttpsDialect"
+
+[project.entry-points."superset.db_engine_specs"]
+osagg = "osagg.engine_spec:OpenSearchAggEngineSpec"
+
+[tool.setuptools]
+packages = ["osagg"]

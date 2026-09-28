@@ -1,0 +1,16 @@
+[Unit]
+Description=Superset tools for AI agents (MCP): data dictionary, Excel extracts, chart images, e-mails, reports
+After=network.target
+
+[Service]
+# edit: the account and paths of your Superset installation
+User=superset
+EnvironmentFile=/opt/superset/ai/tools.env
+# the headless Chromium used by Superset's reports must be on the PATH for chart images
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/opt/superset/ai
+ExecStart=/opt/superset/venv/bin/python /opt/superset/ai/superset_tools_mcp.py --http 127.0.0.1:5009
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
