@@ -1,7 +1,7 @@
 # osagg 0.2.6: binaries
 
 Built from tag `v0.2.6`. The code is on `main`; this branch only holds the files to install.
-Each version has its own branch `binaries-<version>`; older ones are deleted.
+Each version has its own branch `binaries-<version>`; the branches of older versions are kept.
 
 | file | what |
 |---|---|
