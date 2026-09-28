@@ -5,7 +5,7 @@ Each version has its own branch `binaries-<version>`; the branches of older vers
 
 | file | what |
 |---|---|
-| `osagg-0.2.6/osagg-0.2.6-promagg-0.1.0-bundle-py311-linux-x86_64.zip` | offline install for Superset on Python 3.11, Linux x86_64: osagg and promagg wheels with their dependencies, the MCP dependencies, the MCP tools service and agent, `install.sh`, `INSTALL.txt`, `DEPLOY.md`, config snippets, systemd units |
+| `osagg-0.2.6/osagg-0.2.6-promagg-0.2.1-bundle-py311-linux-x86_64.zip` | offline install for Superset on Python 3.11, Linux x86_64: osagg and promagg wheels with their dependencies, the MCP dependencies, the MCP tools service and agent, `install.sh`, `INSTALL.txt`, `DEPLOY.md`, config snippets, systemd units |
 | `osagg-0.2.6/osagg-0.2.6-py3-none-any.whl` | the osagg wheel alone (pure Python), for an online install |
 | `osagg-0.2.6/SHA256SUMS` | checksums |
 
