@@ -7,7 +7,7 @@ upgrade); the lab Superset 6.1 (web server, Celery worker and beat) runs the sam
 against OpenSearch 3.8 and Grafana Mimir 3.2.1. Commands are copy-paste ready; replace the
 values in `<...>`.
 
-**Short path: the bundle.** `osagg-0.2.6-promagg-0.1.0-bundle-py311-linux-x86_64.tar.gz`
+**Short path: the bundle.** `osagg-0.2.7-promagg-0.2.1-bundle-py311-linux-x86_64.tar.gz`
 (38 MB, offline; also in two parts under 30 MB) holds everything: osagg (OpenSearch),
 promagg (Prometheus / Mimir), the packages of Superset 6.1's MCP service, the AI agent and
 its tools service (data dictionary, Excel extracts, chart images, e-mails, reports,
@@ -77,11 +77,11 @@ An LDAP / AD technical account can be mapped to the same role instead of an inte
 
 Files (either one):
 
-* offline, everything: `osagg-0.2.6-bundle-py311-linux-x86_64.tar.gz` (Python 3.11):
+* offline, everything: `osagg-0.2.7-promagg-0.2.1-bundle-py311-linux-x86_64.tar.gz` (Python 3.11):
   `./install.sh $PY` runs the offline command below;
-* offline: `osagg-0.2.6-wheelhouse-py3XX-linux-x86_64.tar.gz` for your Python version
+* offline: `osagg-0.2.7-wheelhouse-py3XX-linux-x86_64.tar.gz` for your Python version
   (`py310`, `py311` or `py312`, about 22 MB): `osagg`, `duckdb`, `opensearch-py`, `Events`;
-* online: `osagg-0.2.6-py3-none-any.whl` alone, when the host can reach PyPI or your
+* online: `osagg-0.2.7-py3-none-any.whl` alone, when the host can reach PyPI or your
   pip mirror (pip downloads the three dependencies).
 
 ```bash
@@ -91,18 +91,18 @@ PY=/opt/superset/venv/bin/python3.11       # what the line above printed, withou
 $PY --version                              # 3.11 -> the py311 archive
 
 # 2a. Offline: extract the archive and install from its wheelhouse folder
-tar xzf osagg-0.2.6-wheelhouse-py311-linux-x86_64.tar.gz
+tar xzf osagg-0.2.7-wheelhouse-py311-linux-x86_64.tar.gz
 $PY -m pip install --upgrade --no-index --find-links ./wheelhouse osagg
 
 # 2b. Or online (PyPI or company mirror)
-$PY -m pip install --upgrade osagg-0.2.6-py3-none-any.whl
+$PY -m pip install --upgrade osagg-0.2.7-py3-none-any.whl
 
 # 3. Check
-$PY -m pip show osagg | head -2            # Version: 0.2.6
+$PY -m pip show osagg | head -2            # Version: 0.2.7
 ```
 
 Already on 0.2.x: only the new wheel is needed, even offline:
-`$PY -m pip install --upgrade --no-index osagg-0.2.6-py3-none-any.whl`
+`$PY -m pip install --upgrade --no-index osagg-0.2.7-py3-none-any.whl`
 
 If `superset` is not on your PATH, its path is in the `ExecStart=` line of your Superset
 service (`systemctl cat <superset service>`).
@@ -861,7 +861,7 @@ replaces the separate agent and tools services of sections 10 and 10b for users 
 keep working for other agents: `superset supagent mcp` serves the same tools over MCP.
 
 ```bash
-$PY -m pip install supagent-0.1.0-py3-none-any.whl     # no new dependency
+$PY -m pip install supagent-0.5.0-py3-none-any.whl     # or the latest supagent release (see its guide)
 # superset_config.py, one line:
 #   from supagent import init_app as FLASK_APP_MUTATOR
 superset supagent init                                  # tables supagent_*, role "AI Agent"

@@ -121,6 +121,12 @@ def test_topn_mode(planner):
     assert s.mode == "topn" and s.topn["order"][0] == {"a0_sum": "desc"}
 
 
+def test_topn_with_limit_0_asks_opensearch_for_one_bucket(planner):
+    sql = f'SELECT "NODE", SUM("JOB_DURATION_d") s FROM "{INDEX}" GROUP BY 1 ORDER BY s DESC LIMIT 0'
+    s = plan(planner, sql, topn="approx").scans[0]
+    assert s.mode == "topn" and s.topn["size"] == 1       # size 0: "[terms] failed to parse field [size]"
+
+
 def test_raw_rows_push_sort_and_limit(planner):
     s = plan(planner, f'SELECT * FROM "{INDEX}" WHERE "APPLICATION" = \'ORDERS\' ORDER BY "@timestamp_date" DESC LIMIT 50').scans[0]
     assert isinstance(s, DocScan) and s.limit == 50

@@ -1109,7 +1109,7 @@ class Planner:
         spec = specs.get(_key(target))
         if spec is None or spec.order_path is None:
             return
-        size = n + off
+        size = max(1, n + off)          # LIMIT 0 (Superset reading a dataset's columns): OpenSearch refuses size 0
         terms: dict[str, Any] = {"field": key.source["terms"]["field"], "size": size,
                                  "shard_size": max(1_000, 10 * size),
                                  "order": [{spec.order_path: "desc" if first.args.get("desc") else "asc"},

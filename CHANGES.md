@@ -1,5 +1,19 @@
 # Changes
 
+## 0.2.7 — 30 Sep 2026
+
+**Top-N with LIMIT 0.** A query ordering its groups by an aggregate with `LIMIT 0` (what
+Superset runs to read the columns of a virtual dataset, for example `... GROUP BY
+"APPLICATION" ORDER BY "FAILED_JOBS" DESC`) asked OpenSearch for a terms aggregation of size
+0, which it refuses (`[terms] failed to parse field [size]`): saving such a dataset failed.
+It now asks for one bucket and returns no rows.
+
+**Bundle.** Carries promagg 0.2.1 (was 0.1.0). Its tools service and agent are unchanged:
+every tool they offer (describe_data, export_excel, chart_image, chart_from_sql, send_email,
+promql_query, check_health, list_alerts, list_reports, create_report, fix_chart_time_range)
+is also in supagent, the agent inside Superset, which serves them over MCP with
+`superset supagent mcp` (DEPLOY.md section 13).
+
 ## Tools and bundle — 27 Sep 2026 (osagg 0.2.6 unchanged, promagg 0.1.0 added)
 
 **Prometheus / Mimir metrics.** The bundle adds promagg (see `promagg-README.md` and
