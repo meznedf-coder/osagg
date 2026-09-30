@@ -861,7 +861,7 @@ replaces the separate agent and tools services of sections 10 and 10b for users 
 keep working for other agents: `superset supagent mcp` serves the same tools over MCP.
 
 ```bash
-$PY -m pip install supagent-0.5.0-py3-none-any.whl     # or the latest supagent release (see its guide)
+$PY -m pip install supagent-0.5.1-py3-none-any.whl     # or the latest supagent release (see its guide)
 # superset_config.py, one line:
 #   from supagent import init_app as FLASK_APP_MUTATOR
 superset supagent init                                  # tables supagent_*, role "AI Agent"
