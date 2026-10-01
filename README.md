@@ -75,8 +75,10 @@ osagg://TRINO_USER:PWD@trino-host:8443/default?transport=trino&trino_http_scheme
 | `max_buckets_total` | `2000000` | cap on groups returned by one aggregation |
 | `page_size` | `50000` | composite page size (also bounded by the cluster `search.max_buckets`) |
 | `topn` | `exact` | `approx`: `ORDER BY <aggregate> LIMIT n` on one key uses a two-phase terms aggregation (exact values, approximate membership at the boundary) |
-| `cardinality_precision` | `3000` | `precision_threshold` of `COUNT(DISTINCT)` (HyperLogLog++) |
+| `count_distinct` | `exact` | `approx`: `COUNT(DISTINCT)` returns the cardinality estimate above `cardinality_precision` (the former behaviour) |
+| `cardinality_precision` | `3000` | `precision_threshold` of the cardinality sketch: below it the count is exact; at it, `count_distinct=exact` counts the values as keys |
 | `percentile_compression` | `500` | TDigest compression for MEDIAN / PERCENTILE_CONT (≈0.3 % max error) |
+| `date_probe` | `true` | `false`: date fields in the default format are not checked for calendar days (values all at 00:00 UTC) |
 | `request_timeout` | `300` | seconds per OpenSearch request |
 | `join_max_keys` | `100000` | joins: an index that no other index filters may have at most this many matching documents or distinct join keys (see Joins of indices) |
 | `label_source`, `label_date_format`, `label_time_source` | `POSITION_DATE`, `%Y%m%d`, `@timestamp_date` | where the business-date labels come from, per index (see Business-date labels) |
@@ -96,8 +98,9 @@ osagg://TRINO_USER:PWD@trino-host:8443/default?transport=trino&trino_http_scheme
 | `DATE_TRUNC('second'…'year', ts)`, `TIME_BUCKET(INTERVAL 'n minutes/hours', ts)`, `CAST(ts AS DATE)` | `date_histogram` with `time_zone` |
 | `FLOOR(x / n) * n` | `histogram` |
 | `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX` (numeric, date, boolean, keyword) | doc_count, value_count, sum, min, max, terms(size 1) |
-| `COUNT(DISTINCT col)`, `APPROX_COUNT_DISTINCT` | cardinality (approximate above `cardinality_precision`) |
-| `MEDIAN`, `QUANTILE_CONT`, `PERCENTILE_CONT … WITHIN GROUP` | percentiles (TDigest) |
+| `COUNT(DISTINCT col)` | cardinality while it is exact (below `cardinality_precision`); at it, the values become keys of the buckets and DuckDB counts them (exact) |
+| `APPROX_COUNT_DISTINCT` | cardinality (an estimate above `cardinality_precision`) |
+| `MEDIAN`, `QUANTILE_CONT`, `PERCENTILE_CONT … WITHIN GROUP` | percentiles (TDigest: an estimate, ≈0.3 % with the default compression) |
 | `STDDEV_SAMP/POP`, `VAR_SAMP/POP` | extended_stats |
 | `SUM(CASE WHEN c THEN x ELSE 0 END)`, `agg(x) FILTER (WHERE c)`, `COUNT_IF(c)` | `filter` sub-aggregation |
 | any other GROUP BY / WHERE expression over grouped columns (`CASE … 'Others'`, `UPPER`, `COALESCE`, `EXTRACT(hour …)`, `strftime`, Sunday weeks) | **two-level**: OpenSearch groups by the underlying columns (timestamps at the needed grain), DuckDB re-aggregates the buckets (sum / count / min / max / avg) |
@@ -207,13 +210,28 @@ requests and OpenSearch time per scan.
 
 ## Semantics worth knowing
 
+* Results are exact, with these exceptions: percentiles (MEDIAN, QUANTILE_CONT,
+  PERCENTILE_CONT are TDigest estimates), `APPROX_COUNT_DISTINCT`, and
+  `count_distinct=approx` / `topn=approx` when you ask for them.
+* An OpenSearch answer from part of the shards (a failed or timed-out shard) is
+  an error, never a result: OpenSearch itself answers HTTP 200 with what the
+  other shards hold.
 * Timestamps are naive wall-clock values in `timezone`. In zones with DST,
   sub-day buckets of the repeated autumn hour are merged, like SQL on local time.
+* Date fields whose format has no time of day (`yyyyMMdd`, `basic_date`, …) and
+  default-format date fields holding only midnights are calendar days in UTC,
+  whatever `timezone`; `= 20261001` is read in the field's own format.
+* A field the indices of a pattern map differently (text with `.keyword` here,
+  keyword there; date here, keyword there) is compared in each group of indices
+  as that group maps it, as Discover's filters do.
 * Multi-valued fields: grouping counts a document once per value (OpenSearch
-  terms semantics, like `UNNEST`); `col = 'x'` matches if any value matches.
-  Raw rows return multi-valued keyword fields as JSON text.
+  terms semantics, like `UNNEST`); `col = 'x'` matches if any value matches;
+  `COUNT(col)` of a keyword or number counts its values and `SUM` adds them all. Raw rows return
+  multi-valued keyword fields as JSON text and the first value of a number.
 * `text` fields are grouped / compared exactly through their keyword sub-field
-  (`field.keyword`); text fields without one cannot be grouped.
+  (`field.keyword`); text fields without one cannot be grouped. Values longer
+  than the keyword's `ignore_above` (256 in the dynamic mapping) are not in it:
+  where a field has some, they are read from the documents.
 * `nested` fields are not exposed.
 * Through Trino, raw-document queries are limited to 10 000 rows per query
   (no point-in-time through `raw_query`); aggregations have no such limit.

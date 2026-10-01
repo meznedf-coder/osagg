@@ -1,5 +1,51 @@
 # Changes
 
+## 0.2.8 — not released (branch dev-0.2.8)
+
+Counts that were silently wrong, found while reviewing a production count far below what Discover
+showed for the same filters. Each was reproduced on a lab cluster with the truth computed from the
+generated documents, and each has a test that fails on 0.2.7.
+
+**A field the indices of a pattern map differently.** If one index mapped a field as text with a
+`.keyword` sub-field and another mapped it as keyword, osagg filtered on `<field>.keyword` everywhere.
+The second index's documents then matched nothing: 10 counted instead of 1,210. Every condition on such
+a field is now built per group of indices, each with its own exact field and type. GROUP BY reads each
+index's exact field. The business-date label (`POSITION_LABEL`) computed from such a field also counted
+only the first group of indices: 5 instead of 155.
+
+**Business dates mapped as dates** (`yyyyMMdd`, `basic_date`, ...).
+- `= 20261001` was read as epoch milliseconds (1970).
+- `'2026-10-01'` was read as midnight in the connection's zone, which in Paris is 22:00 UTC the day
+  before.
+- Both counted nothing, and ranges gained or lost a day.
+
+Such a field is now a calendar day in UTC, and its literals are read in the field's own format.
+Default-format date fields whose values are all at midnight UTC are detected once per table and read the
+same way (`date_probe=false` turns this off). A literal a field cannot hold now raises a clear error
+instead of matching nothing.
+
+**COUNT(DISTINCT) is exact.** It was a cardinality sketch: above 3,000 values it returned an estimate
+without saying so (56,171 for 55,653). The sketch is still used while it is exact. When it reaches its
+threshold, the query is counted again with the values as keys. `count_distinct=approx` keeps the
+estimate.
+
+**Text values longer than their keyword.** OpenSearch's dynamic mapping gives text fields a keyword
+sub-field with `ignore_above: 256`, and a longer value (an error description, a stack trace) is not in
+that keyword. Such values were grouped under NULL, and `=`, `<>`, `LIKE`, `IN`, `COUNT(col)`,
+`COUNT(DISTINCT)` and `IS NULL` missed them.
+- osagg now counts these documents once per table, and where needed reads the field from the documents.
+- `=`, `IN`, `IS NULL` and `COUNT(col)` find a long value at once, even one that arrives after the table
+  was read.
+- GROUP BY and `LIKE` notice the first long value of a field when the metadata is refreshed, within 5
+  minutes.
+
+**An answer from part of the shards is an error.** When a shard fails (a node gone, a rejected or
+out-of-memory shard search, a script error in some indices), OpenSearch still answers HTTP 200 with what
+the other shards hold. osagg returned those partial counts. Searches now ask for all shards
+(`allow_partial_search_results=false`), and any answer with failed shards or a timeout raises an error
+naming the shards and the reason; busy shards are retried first. This applies through Trino as well.
+In the lab, OpenSearch counted 1,200 of 1,210 documents with one shard failed, and 0.2.7 returned 1,200.
+
 ## 0.2.7 — 30 Sep 2026
 
 **Top-N with LIMIT 0.** A query ordering its groups by an aggregate with `LIMIT 0` (what

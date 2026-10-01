@@ -53,6 +53,8 @@ class Field:
     # the field mapped differently in the indices of a pattern: ((indices, the field as those see it), ...)
     variants: tuple | None = None
     midnight: bool = False    # a date field whose values are all at 00:00 UTC (calendar days; see probe)
+    exact_max: int | None = None  # ignore_above of the exact (keyword) field: longer values are not in it
+    long_values: bool = False  # some documents have the text but not the keyword (longer than exact_max)
 
     @property
     def is_date(self) -> bool:
@@ -243,14 +245,14 @@ def _walk(props: dict, prefix: str, out: dict[str, Field], aliases: list[tuple[s
         if ftype in KEYWORDISH:
             out[path] = Field(path, ftype, "VARCHAR", agg_field=path, source_path=path)
         elif ftype in TEXTISH:
-            sub = None
+            sub, limit = None, None
             for sname, sspec in (spec.get("fields") or {}).items():
                 if sspec.get("type") in ("keyword", "wildcard", "constant_keyword"):
-                    sub = f"{path}.{sname}"
+                    sub, limit = f"{path}.{sname}", sspec.get("ignore_above")
                     break
             fielddata = bool(spec.get("fielddata"))
             out[path] = Field(path, ftype, "VARCHAR", agg_field=sub or (path if fielddata else None),
-                              source_path=path, is_text=True)
+                              source_path=path, is_text=True, exact_max=int(limit) if limit else None)
         elif ftype in INT_TYPES:
             out[path] = Field(path, ftype, INT_TYPES[ftype], agg_field=path, source_path=path)
         elif ftype in FLOAT_TYPES:
@@ -350,6 +352,8 @@ class MetadataCache:
             fields = fields_from_mapping(resp)
             if date_probe and not slow:
                 fields = probe_midnight_dates(transport, name, fields)
+            if not slow:
+                fields = probe_long_values(transport, name, fields)
             if slow:
                 # discovery through Trino samples documents and probes fields (seconds):
                 # share the result between Superset processes through a small disk cache
@@ -466,10 +470,9 @@ def probe_midnight_dates(transport: Transport, index: str, fields: dict[str, Fie
         aggs["s"] = {"sampler": {"shard_size": 2000}, "aggs": {
             f"v{i}": {"terms": {"field": f.agg_field, "size": 200}} for i, (_, f, _) in enumerate(cands)}}
         body: dict = {"size": 0, "track_total_hits": False, "aggs": aggs}
-        if ix:
-            body["query"] = {"terms": {"_index": list(ix)}}
         try:
-            res = transport.search(index, body)
+            # a group's own indices only: elsewhere the field may be text, whose shards fail the aggregations
+            res = transport.search(_indices_of(index, ix), body)
         except Exception:  # pylint: disable=broad-except   (no probe: the format decides alone)
             logger.debug("osagg: the probe of the date fields of %s failed", index, exc_info=True)
             continue
@@ -493,6 +496,64 @@ def probe_midnight_dates(transport: Transport, index: str, fields: dict[str, Fie
                 views = list(merged.variants)
                 views[pos] = (views[pos][0], dataclasses.replace(views[pos][1], midnight=True))
                 out[name] = dataclasses.replace(merged, variants=tuple(views))
+    return out
+
+
+def _indices_of(index: str, ix: tuple) -> str:
+    """The indices of one group of a pattern, as a search target (the latest ones if the list is long)."""
+    if not ix:
+        return index
+    names = sorted(ix)
+    while len(names) > 1 and len(",".join(names)) > 2000:
+        names = names[len(names) // 2:]
+    return ",".join(names)
+
+
+def probe_long_values(transport: Transport, index: str, fields: dict[str, Field]) -> dict[str, Field]:
+    """Text fields whose keyword sub-field has ignore_above (256 in OpenSearch's dynamic mapping): documents
+    whose value is longer have the text but not the keyword, which exact filters, groups and counts read (a
+    long error description counted as NULL). One request counts them per field (per group of indices for
+    a field the indices map differently); a field with some is read from the documents where it must be
+    exact (long_values)."""
+    cands: list[tuple[str, Field, int | None, tuple]] = []
+    for f in fields.values():
+        if f.virtual:
+            continue
+        if f.variants:
+            for pos, (ix, v) in enumerate(f.variants):
+                if v.is_text and v.exact_max and v.agg_field and v.agg_field != v.name:
+                    cands.append((f.name, v, pos, tuple(ix)))
+        elif f.is_text and f.exact_max and f.agg_field and f.agg_field != f.name:
+            cands.append((f.name, f, None, ()))
+    cands = cands[:PROBE_FIELDS]
+    if not cands:
+        return fields
+    aggs = {}
+    for i, (_, f, _, ix) in enumerate(cands):
+        q: dict = {"bool": {"filter": [{"exists": {"field": f.name}}],
+                            "must_not": [{"exists": {"field": f.agg_field}}]}}
+        if ix:
+            q["bool"]["filter"].append({"terms": {"_index": list(ix)}})
+        aggs[f"l{i}"] = {"filter": q}
+    try:
+        res = transport.search(index, {"size": 0, "track_total_hits": False, "aggs": aggs})
+    except Exception:  # pylint: disable=broad-except
+        logger.debug("osagg: the probe of the long text values of %s failed", index, exc_info=True)
+        return fields
+    out = dict(fields)
+    for i, (name, f, pos, ix) in enumerate(cands):
+        n = ((res.get("aggregations") or {}).get(f"l{i}") or {}).get("doc_count") or 0
+        if not n:
+            continue
+        logger.info("osagg: %s of %s: %d document(s) longer than its keyword's %d characters", name,
+                    index if not ix else f"{len(ix)} of the indices of {index}", n, f.exact_max)
+        if pos is None:
+            out[name] = dataclasses.replace(f, long_values=True)
+        else:
+            merged = out[name]
+            views = list(merged.variants)
+            views[pos] = (views[pos][0], dataclasses.replace(views[pos][1], long_values=True))
+            out[name] = dataclasses.replace(merged, variants=tuple(views), long_values=True)
     return out
 
 

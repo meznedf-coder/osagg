@@ -32,6 +32,15 @@ class Untranslatable(Exception):
     """Expression cannot be pushed down to OpenSearch."""
 
 
+class Candidate(Untranslatable):
+    """No exact OpenSearch query: `query` keeps a superset of the rows (every row the condition keeps), the
+    condition itself is evaluated in DuckDB on the documents' values (a text longer than its keyword)."""
+
+    def __init__(self, message: str, query: dict) -> None:
+        super().__init__(message)
+        self.query = query
+
+
 class NotNumeric(Untranslatable):
     """SUM / AVG / STDDEV / VARIANCE of a text field: not valid SQL anywhere, so there is
     no point in fetching documents to compute it; the message tells what to use."""
@@ -304,7 +313,28 @@ def q_not(q: dict) -> dict:
 def q_exists(f: Field) -> dict:
     if f.name == "_id":
         return MATCH_ALL
+    if f.is_text and f.exact_max and f.agg_field and f.agg_field != f.name and not f.variants:
+        # the keyword holds the values up to exact_max characters, the text every value
+        return q_or([{"exists": {"field": f.agg_field}}, {"exists": {"field": f.name}}])
     return {"exists": {"field": f.agg_field or f.name}}
+
+
+def _long_rows(f: Field) -> dict:
+    """The documents whose value is longer than the field's keyword (the text without the keyword)."""
+    return {"bool": {"filter": [{"exists": {"field": f.name}}], "must_not": [{"exists": {"field": f.agg_field}}]}}
+
+
+def _too_long(f: Field, v: Any) -> bool:
+    """A value the keyword of this text field cannot hold (ignore_above counts UTF-16 units, as Java does)."""
+    return bool(f.is_text and f.exact_max and isinstance(v, str)
+                and len(v) > f.exact_max // 2 and len(v.encode("utf-16-le")) // 2 > f.exact_max)
+
+
+def _long_match(f: Field, longs: list[str]) -> dict:
+    """The documents whose text may be one of these long values (DuckDB compares the whole value). Probed or
+    not, the keyword never holds them: a field that gets its first long value is right at once."""
+    return q_and([_long_rows(f), q_or([{"match_phrase": {f.name: {"query": v, "zero_terms_query": "all"}}}
+                                       for v in longs])])
 
 
 @dataclass
@@ -374,6 +404,9 @@ def _eq(f: Field, value: Any, ctx: Ctx) -> dict:
     v = coerce_for_field(value, f, ctx)
     if v is None:
         return MATCH_NONE
+    if _too_long(f, v):
+        raise Candidate(f"{f.name}: a value longer than its keyword's {f.exact_max} characters",
+                        _long_match(f, [v]))
     if f.is_date:
         if v % 1000:
             return MATCH_NONE  # stored with ms precision
@@ -388,6 +421,11 @@ def _in(f: Field, values: list[Any], ctx: Ctx) -> dict:
     vals = [v for v in vals if v is not None]
     if not vals:
         return MATCH_NONE
+    longs = [v for v in vals if _too_long(f, v)]
+    if longs:
+        shorts = [v for v in vals if not _too_long(f, v)]
+        raise Candidate(f"{f.name}: a value longer than its keyword's {f.exact_max} characters",
+                        q_or([_long_match(f, longs)] + [{"term": {_exact_field(f): v}} for v in shorts]))
     if f.is_date:
         return q_or([_eq(f, v_raw, ctx) for v_raw in values if v_raw is not None])
     if f.name == "_id":
@@ -443,6 +481,10 @@ def like_to_wildcard(pattern: str, escape: str | None) -> tuple[str, str]:
 def _like(f: Field, pattern: Any, escape: str | None, insensitive: bool) -> dict:
     if not isinstance(pattern, str):
         raise Untranslatable("LIKE pattern must be a string literal")
+    if f.long_values:                                  # the long values are not in the keyword
+        short = _like(dataclasses.replace(f, long_values=False), pattern, escape, insensitive)
+        raise Candidate(f"{f.name}: LIKE also over values longer than its keyword's {f.exact_max} characters",
+                        q_or([short, _long_rows(f)]))
     fld = _exact_field(f)
     kind, val = like_to_wildcard(pattern, escape)
     if kind == "term":
@@ -530,12 +572,19 @@ def _per_index(node: exp.Expression, ctx: Ctx) -> Pred | None:
     for index in ctx.meta.indices:
         key = tuple(next((v for ix, v in f.variants if index in ix), f.variants[0][1]) for f in mixed.values())
         cells.setdefault(key, []).append(index)          # an index without the field: NULL there, as any view
-    trues, falses = [], []
+    trues, falses, wider = [], [], None
     for key, indices in cells.items():
-        p = predicate(node, ctx.with_fields(dict(zip(mixed, key))))
         only = {"terms": {"_index": indices}}
+        try:
+            p = predicate(node, ctx.with_fields(dict(zip(mixed, key))))
+        except Candidate as ex:                       # these indices hold values longer than their keyword
+            wider = ex
+            trues.append(q_and([only, ex.query]))
+            continue
         trues.append(q_and([only, p.true]))
         falses.append(q_and([only, p.false]))
+    if wider is not None:                             # the rows it keeps are among these; DuckDB decides
+        raise Candidate(str(wider), q_or(trues))
     return Pred(true=q_or(trues), false=q_or(falses))
 
 
@@ -551,10 +600,16 @@ def predicate(node: exp.Expression, ctx: Ctx) -> Pred:
         a, b = predicate(node.this, ctx), predicate(node.expression, ctx)
         return Pred(true=q_and([a.true, b.true]), false=q_or([a.false, b.false]))
     if isinstance(node, exp.Or):
-        a, b = predicate(node.this, ctx), predicate(node.expression, ctx)
+        try:
+            a, b = predicate(node.this, ctx), predicate(node.expression, ctx)
+        except Candidate as ex:                        # a superset of one side is none of the OR
+            raise Untranslatable(str(ex)) from ex
         return Pred(true=q_or([a.true, b.true]), false=q_and([a.false, b.false]))
     if isinstance(node, exp.Not):
-        p = predicate(node.this, ctx)
+        try:
+            p = predicate(node.this, ctx)
+        except Candidate as ex:                        # nor of its negation
+            raise Untranslatable(str(ex)) from ex
         return Pred(true=p.false, false=p.true)
     if is_constant(node):
         v = ctx.const_eval(node)
@@ -623,14 +678,20 @@ def predicate(node: exp.Expression, ctx: Ctx) -> Pred:
             if value is None:
                 ex = q_exists(fl)
                 return Pred(true=ex, false=q_not(ex))
-            t = _eq(fl, value, ctx)
+            try:
+                t = _eq(fl, value, ctx)
+            except Candidate as cand:
+                raise Untranslatable(str(cand)) from cand
             return Pred(true=q_not(t), false=t)
         if value is None:  # comparison with NULL is never TRUE nor FALSE
             return Pred(true=MATCH_NONE, false=MATCH_NONE)
         if isinstance(node, exp.EQ):
             return _leaf(_eq(fl, value, ctx), [fl])
         if isinstance(node, exp.NEQ):
-            p = _leaf(_eq(fl, value, ctx), [fl])
+            try:
+                p = _leaf(_eq(fl, value, ctx), [fl])
+            except Candidate as cand:
+                raise Untranslatable(str(cand)) from cand
             return Pred(true=p.false, false=p.true)
         op = CMP_OPS[type(node)]
         if flipped:
@@ -785,6 +846,8 @@ def group_key(node: exp.Expression, ctx: Ctx) -> GroupKey | None:
     node = _strip(node)
     f = ctx.field_of(node)
     if f is not None:
+        if f.long_values:
+            return None                                  # long values are not in the keyword: from the documents
         if f.name != "_id" and f.agg_field is None and f.variants:
             return _variant_key(f)
         if f.name == "_id" or f.agg_field is None:
@@ -1066,8 +1129,8 @@ def _plain_aggregate(agg: exp.Expression, ctx: Ctx, name: str) -> AggSpec:
             if len(exprs) != 1:
                 raise Untranslatable("COUNT(DISTINCT a, b)")
             f = _num_field(exprs[0], ctx)
-            if f.agg_field is None and not f.variants:
-                raise Untranslatable(f"COUNT(DISTINCT {f.name}): field is not aggregatable")
+            if (f.agg_field is None and not f.variants) or f.long_values:
+                raise Untranslatable(f"COUNT(DISTINCT {f.name}): not every value is aggregatable")
             if ctx.exact_distinct and ctx.distinct_mode != "approx":
                 # exact: the values become keys of the buckets, DuckDB counts them
                 return AggSpec("BIGINT", {}, lambda b: None, True, [], "", distinct_of=exprs[0])
@@ -1083,6 +1146,11 @@ def _plain_aggregate(agg: exp.Expression, ctx: Ctx, name: str) -> AggSpec:
         if f.name == "_id":
             ex = lambda b: b["doc_count"]  # noqa: E731
             return AggSpec("BIGINT", {}, ex, True, [("BIGINT", ex)], "SUM({0})")
+        if f.long_values or (f.is_text and f.exact_max and f.agg_field and f.agg_field != f.name):
+            n = f"{name}_has"                            # rows with a value, longer than the keyword included
+            ex = lambda b, _n=n: b[_n]["doc_count"]  # noqa: E731
+            return AggSpec("BIGINT", {n: {"filter": q_exists(f)}}, ex, True, [("BIGINT", ex)], "SUM({0})",
+                           bucket_aggs=1)
         if f.agg_field is None:
             raise Untranslatable(f"COUNT({f.name}): field is not aggregatable")
         n = f"{name}_vc"

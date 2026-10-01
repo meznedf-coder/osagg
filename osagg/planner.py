@@ -35,6 +35,7 @@ from osagg import calendar
 from osagg.errors import ProgrammingError, PushdownError
 from osagg.metadata import SORTABLE_FORMATS, Field, TableMeta
 from osagg.translate import (
+    Candidate,
     zone_of,
     MATCH_ALL,
     MATCH_NONE,
@@ -802,6 +803,10 @@ class Planner:
             isinstance(n, exp.Anonymous) and n.name.lower() == "osagg_label"
             for n in p[0].walk()) else 1)
         for c, why in preds:
+            if isinstance(why, Candidate):            # its values are not all in the keyword: DuckDB decides
+                out.append(c)
+                notes.append(f"WHERE term {where_label}: {c.sql(dialect='duckdb')} ({why})")
+                continue
             base = q_and(pushed) if pushed else MATCH_ALL
             q = self._label_filter(c, ctx, base, notes)
             if q is None:
@@ -833,7 +838,7 @@ class Planner:
         if len(fields) != 1:
             return None
         f = next(iter(fields.values()))
-        if (f.agg_field is None and not _same_kind_text(f)) or f.is_date or f.name == "_id":
+        if (f.agg_field is None and not _same_kind_text(f)) or f.is_date or f.name == "_id" or f.long_values:
             return None
         values = self.enumerate_values(meta.name, base_query, f, self.settings.enum_max_values)
         if values is None:
@@ -939,6 +944,7 @@ class Planner:
         pushed: list[dict] = []
         residual_preds: list[exp.Expression] = []
         done: list[exp.Expression] = []
+        supersets: list[dict] = []                    # rows a residual condition can keep (Candidate)
         where = select.args.get("where")
         for c in conjuncts(where.this if where is not None else None):
             try:
@@ -946,6 +952,8 @@ class Planner:
                 done.append(c)
             except Untranslatable as ex:
                 residual_preds.append((c, ex))
+                if isinstance(ex, Candidate):
+                    supersets.append(ex.query)
         residual_preds = self._enumerate_residual(residual_preds, ctx, meta, pushed, notes,
                                                   "evaluated after aggregation")
         query = q_and(pushed) if pushed else MATCH_ALL
@@ -980,6 +988,10 @@ class Planner:
         distinct_keys = any(specs[_key(a)].distinct_of is not None for a in agg_nodes if _key(a) in specs)
         if distinct_keys:
             notes.append("COUNT(DISTINCT) counted exactly: its values are keys of the buckets")
+        if supersets:
+            # a value longer than a text's keyword: grouping on the keyword would put its rows under NULL
+            notes.append("rows read from the documents: a value longer than a text field's keyword")
+            return self._fallback_scan(select, table, meta, ctx, pushed + supersets, notes, done)
         if all_direct and not failed and not (dst_merge and decomposable) and not distinct_keys:
             if dst_merge:
                 notes.append("sub-day buckets in a DST time zone: the repeated hour at the end of "
@@ -1021,7 +1033,7 @@ class Planner:
             notes.extend(f"aggregate not pushable: {f}" for f in failed)
         else:
             notes.append("non-decomposable aggregate over non-pushable group keys / filters")
-        return self._fallback_scan(select, table, meta, ctx, pushed, notes, done)
+        return self._fallback_scan(select, table, meta, ctx, pushed + supersets, notes, done)
 
     def _needs_dst_merge(self, keys: list[GroupKey | None]) -> bool:
         """Sub-day buckets in a zone with DST: the repeated local hour yields two buckets
@@ -1366,6 +1378,8 @@ class Planner:
                 done.append(c)
             except Untranslatable as ex:
                 residual.append((c, ex))
+                if isinstance(ex, Candidate):          # the rows it can keep; DuckDB decides (WHERE kept)
+                    pushed.append(ex.query)
         residual = self._enumerate_residual(residual, ctx, meta, pushed, notes, "evaluated in DuckDB")
         query = q_and(pushed) if pushed else MATCH_ALL
 

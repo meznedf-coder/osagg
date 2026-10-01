@@ -34,6 +34,40 @@ def _busy(ex: Exception) -> bool:
         s in text for s in ("circuit_breaking_exception", "Data too large", "rejected_execution_exception"))
 
 
+class PartialResults(OperationalError):
+    """OpenSearch answered from some of the shards only."""
+
+    def __init__(self, message: str, busy: bool) -> None:
+        super().__init__(message)
+        self.busy = busy
+
+
+def check_complete(res: dict, index: str) -> dict:
+    """OpenSearch answers 200 with what the shards it could read hold when others fail (a node gone, a shard
+    search rejected or out of memory, a search timeout): counts and sums from part of the data, and nothing
+    in the answer says so but _shards / timed_out. Such an answer is an error here, never a result."""
+    shards = res.get("_shards") or {}
+    failed = int(shards.get("failed") or 0)
+    if not failed and not res.get("timed_out"):
+        return res
+    reasons = []
+    for fail in shards.get("failures") or []:
+        r = fail.get("reason") or {}
+        why = f"{r.get('type')}: {r.get('reason')}" if isinstance(r, dict) else str(r)
+        if why not in reasons:
+            reasons.append(why)
+    busy = bool(reasons) and all(any(s in w for s in ("rejected_execution", "circuit_breaking", "Data too large"))
+                                 for w in reasons)
+    if failed:
+        what = f"{failed} of the {shards.get('total', '?')} shards of {index} failed"
+    else:
+        what = f"the search of {index} timed out"
+    raise PartialResults(f"OpenSearch answered from part of the data only ({what}"
+                         + (f": {'; '.join(reasons[:3])[:600]}" if reasons else "")
+                         + "). No result is computed from part of the data: run the query again, and if this "
+                         "persists check the cluster's health (GET _cluster/health).", busy)
+
+
 class Transport:
     """Interface."""
 
@@ -143,11 +177,20 @@ class DirectTransport(Transport):
 
     def search(self, index: str, body: dict, timeout: float | None = None) -> dict:
         t0 = time.perf_counter()
-        params = {"request_timeout": timeout or self.request_timeout}
-        if "pit" in body:  # PIT searches must not name the index
-            res = self._call(self.client.search, body=body, params=params)
-        else:
-            res = self._call(self.client.search, index=index, body=body, params=params)
+        # a failing shard fails the request rather than leaving its documents out (checked below as well)
+        params = {"request_timeout": timeout or self.request_timeout, "allow_partial_search_results": "false"}
+        for attempt in range(len(BUSY_RETRY_DELAYS) + 1):
+            if "pit" in body:  # PIT searches must not name the index
+                res = self._call(self.client.search, body=body, params=params)
+            else:
+                res = self._call(self.client.search, index=index, body=body, params=params)
+            try:
+                check_complete(res, index)
+                break
+            except PartialResults as ex:
+                if not ex.busy or attempt == len(BUSY_RETRY_DELAYS):
+                    raise
+                self._wait(ex, attempt)
         logger.debug("search %s took=%sms wall=%.0fms", index, res.get("took"),
                      (time.perf_counter() - t0) * 1000)
         return res
@@ -293,7 +336,7 @@ class TrinoTransport(Transport):
                      (time.perf_counter() - t0) * 1000)
         if "error" in res:
             raise ProgrammingError(f"OpenSearch rejected the request: {res['error']}")
-        return res
+        return check_complete(res, index)
 
     def trino_query(self, sql: str) -> tuple[list[tuple], list[str]]:
         """Run a plain Trino query (used for delegated raw-document scans)."""
