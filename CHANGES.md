@@ -1,6 +1,6 @@
 # Changes
 
-## 0.2.8 — not released (branch dev-0.2.8)
+## 0.2.8 — 1 Oct 2026
 
 Counts that were silently wrong, found while reviewing a production count far below what Discover
 showed for the same filters. Each was reproduced on a lab cluster with the truth computed from the
@@ -48,6 +48,10 @@ In the lab, OpenSearch counted 1,200 of 1,210 documents with one shard failed, a
 Points in time (deep reads beyond 10,000 rows) are created on every shard or not at all
 (`allow_partial_pit_creation=false`): one created on part of the shards would answer every page with no
 failed shard while documents are missing.
+
+**Bundle.** Carries promagg 0.2.2 (was 0.2.1): exact increases per time bucket with Mimir's anchored
+ranges, and a backend warning or a native histogram sample is an error instead of a silently incomplete
+result (see `promagg-README.md`).
 
 **Upgrading.** A chart whose answers were silently partial (for example an index of a pattern whose
 mapping makes a shard fail) now shows an error naming the shards and the reason instead of a smaller

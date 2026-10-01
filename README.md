@@ -40,7 +40,7 @@ troubleshooting): [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ```bash
 PY=$(head -1 "$(command -v superset)" | cut -c3-)          # the Python that runs Superset
-$PY -m pip install --upgrade osagg-0.2.7-py3-none-any.whl   # deps: duckdb, opensearch-py, Events
+$PY -m pip install --upgrade osagg-0.2.8-py3-none-any.whl   # deps: duckdb, opensearch-py, Events
 # offline: $PY -m pip install --upgrade --no-index --find-links ./wheelhouse osagg
 $PY -m pip install trino                                     # only for transport=trino
 ```
