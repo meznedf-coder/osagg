@@ -7,7 +7,7 @@ upgrade); the lab Superset 6.1 (web server, Celery worker and beat) runs the sam
 against OpenSearch 3.8 and Grafana Mimir 3.2.1. Commands are copy-paste ready; replace the
 values in `<...>`.
 
-**Short path: the bundle.** `osagg-0.2.10-promagg-0.2.2-bundle-py311-linux-x86_64.tar.gz`
+**Short path: the bundle.** `osagg-0.2.11-promagg-0.2.2-bundle-py311-linux-x86_64.tar.gz`
 (38 MB, offline; also in two parts under 30 MB) holds everything: osagg (OpenSearch),
 promagg (Prometheus / Mimir), the packages of Superset 6.1's MCP service, the AI agent and
 its tools service (data dictionary, Excel extracts, chart images, e-mails, reports,
@@ -77,11 +77,11 @@ An LDAP / AD technical account can be mapped to the same role instead of an inte
 
 Files (either one):
 
-* offline, everything: `osagg-0.2.10-promagg-0.2.2-bundle-py311-linux-x86_64.tar.gz` (Python 3.11):
+* offline, everything: `osagg-0.2.11-promagg-0.2.2-bundle-py311-linux-x86_64.tar.gz` (Python 3.11):
   `./install.sh $PY` runs the offline command below;
-* offline: `osagg-0.2.10-wheelhouse-py3XX-linux-x86_64.tar.gz` for your Python version
+* offline: `osagg-0.2.11-wheelhouse-py3XX-linux-x86_64.tar.gz` for your Python version
   (`py310`, `py311` or `py312`, about 22 MB): `osagg`, `duckdb`, `opensearch-py`, `Events`;
-* online: `osagg-0.2.10-py3-none-any.whl` alone, when the host can reach PyPI or your
+* online: `osagg-0.2.11-py3-none-any.whl` alone, when the host can reach PyPI or your
   pip mirror (pip downloads the three dependencies).
 
 ```bash
@@ -91,18 +91,18 @@ PY=/opt/superset/venv/bin/python3.11       # what the line above printed, withou
 $PY --version                              # 3.11 -> the py311 archive
 
 # 2a. Offline: extract the archive and install from its wheelhouse folder
-tar xzf osagg-0.2.10-wheelhouse-py311-linux-x86_64.tar.gz
+tar xzf osagg-0.2.11-wheelhouse-py311-linux-x86_64.tar.gz
 $PY -m pip install --upgrade --no-index --find-links ./wheelhouse osagg
 
 # 2b. Or online (PyPI or company mirror)
-$PY -m pip install --upgrade osagg-0.2.10-py3-none-any.whl
+$PY -m pip install --upgrade osagg-0.2.11-py3-none-any.whl
 
 # 3. Check
-$PY -m pip show osagg | head -2            # Version: 0.2.10
+$PY -m pip show osagg | head -2            # Version: 0.2.11
 ```
 
 Already on 0.2.x: only the new wheel is needed, even offline:
-`$PY -m pip install --upgrade --no-index osagg-0.2.10-py3-none-any.whl`
+`$PY -m pip install --upgrade --no-index osagg-0.2.11-py3-none-any.whl`
 
 If `superset` is not on your PATH, its path is in the `ExecStart=` line of your Superset
 service (`systemctl cat <superset service>`).
@@ -471,6 +471,25 @@ Logs (`osagg` logger, INFO, in the Superset log): one line per request, e.g.
 | Charts time out | `SUPERSET_WEBSERVER_TIMEOUT`, gunicorn `--timeout`, `request_timeout`; use `topn=approx` for top-N tables |
 | Day boundaries off by 1–2 h | set `timezone=Europe/Paris` |
 | Alerts never run | Celery worker and beat must be running and have osagg; the metadata DB must be PostgreSQL or MySQL |
+| A count far below Discover's | run the query with `EXPLAIN`: it lists the indices the table reads and **warns about indices of the same name (apart from `-`, `_`, `.`) it does not read**. Usual cause: the table is an alias put on indices with a wildcard (`POST _aliases` with `"index": "logs-*"`): it keeps the indices of that moment, so the index created next month is not in it. Fix below (*An alias for every new index*), or read the index pattern itself (`FROM "logs-*"`) |
+
+### An alias for every new index
+
+An alias added with a wildcard keeps the indices that existed at that moment: a monthly index created later is not
+in it, and every query on the alias misses that month (seen in production on 2 October: the 2026.10 index was not
+in the alias). Put the alias in the **index template** that creates the indices, so each new index gets it when it
+is created (checked on OpenSearch 3.8):
+
+1. What next month's index will get (settings, mappings, aliases) and which templates match it:
+   `POST _index_template/_simulate_index/<an index name of next month>`
+2. In `GET _index_template`, the composable template whose `index_patterns` cover your indices: add
+   `"aliases": { "<alias>": {} }` inside its `"template"` and `PUT` the whole template back (PUT replaces it). If
+   only a shared template matches (`*`, or one other indices use too), create one for your pattern with a higher
+   `priority`, with the settings and mappings step 1 showed, plus the alias.
+3. Step 1 again: the alias is listed, the settings and mappings are the same.
+
+A legacy template (`PUT _template/...`) is ignored as soon as a composable template matches the index (even a
+`*` one): use the composable templates. For the indices that exist already: `POST _aliases` with an `add` action.
 
 ## 9. Upgrade and rollback
 

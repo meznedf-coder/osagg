@@ -573,6 +573,9 @@ class Cursor:
         lines: list[str] = [f"-- osagg {__version__}, {self.connection.transport.kind} transport, time zone "
                             f"{self.connection.tz}"]
         lines += _fields_read(named, plan, self.connection.table_meta)
+        for index in dict.fromkeys(getattr(s, "index", None) for s in plan.scans):
+            if index:
+                lines += _indices_read(self.connection, index)
         for i, scan in enumerate(_run_order(plan.scans), 1):
             st = stats.get(scan.table)
             mode = getattr(scan, "mode", "")
@@ -644,6 +647,97 @@ def _fields_read(names: set[str], plan: Any, lookup: Any) -> list[str]:
             n = len(meta.indices)
             out.append(f"-- fields of {index} ({n} {'index' if n == 1 else 'indices'}):")
             out += rows
+    return out
+
+
+SEPARATORS = re.compile(r"[-_.]+")
+FAMILY_SHOWN = 4          # names of indices written out (the first and the last ones)
+
+
+def _norm_name(name: str) -> str:
+    """An index name with "-", "_" and "." alike: batch_jobs-2026.10 and batch-jobs_2026_10 are one family."""
+    return SEPARATORS.sub("-", (name or "").lower())
+
+
+def _some(names: list[str]) -> str:
+    if len(names) <= FAMILY_SHOWN:
+        return ", ".join(names)
+    return ", ".join(names[:2] + ["…"] + names[-2:])
+
+
+def _family_others(transport: Any, pattern: str, read: set[str]) -> list[str]:
+    """The indices whose names are the pattern's with "-", "_" or "." in other places (script_jobs* and
+    script-jobs-2026.10) that this query does not read: an alias that did not take a new index (an alias put on
+    indices by a wildcard keeps the indices of that moment), or the other spelling of a name. The first thing to check
+    when a count differs from Discover's, whose index pattern may read them. Direct transport only; an account that
+    may not list them: nothing said."""
+    if getattr(transport, "kind", "") != "direct" or "," in pattern:
+        return []
+    wide = SEPARATORS.sub("*", pattern)
+    if wide == pattern:
+        return []
+    try:
+        found = transport.list_tables([wide])
+    except Exception:  # pylint: disable=broad-except   (a hint only)
+        return []
+    want = _norm_name(pattern)
+    out = set()
+    for name, kind in found:
+        if kind in ("pattern", "alias") or name in read or name.startswith(".") or fnmatch.fnmatchcase(name, pattern):
+            continue
+        if fnmatch.fnmatchcase(_norm_name(name), want):
+            out.add(name)
+    return sorted(out)
+
+
+def _family_pattern(pattern: str, name: str) -> str:
+    """A pattern that reads the family of `name` the way `pattern` meant it: the start of `name` that says what the
+    start of `pattern` says, then * (script_jobs* and script-jobs-2026.10 -> script-jobs*)."""
+    head = pattern.split("*", 1)[0]
+    want = _norm_name(head)
+    for i in range(1, len(name) + 1):
+        if _norm_name(name[:i]) == want and (i == len(name) or _norm_name(name[:i + 1]) != want):
+            return name[:i] + ("*" if "*" in pattern or i < len(name) else "")
+    return name
+
+
+def _indices_read(conn: Any, index: str) -> list[str]:
+    """EXPLAIN: the indices a table reads (with their documents), and the indices of the same family it does not
+    read (an alias missing this month's index...)."""
+    try:
+        meta = conn.table_meta(index)
+    except Exception:  # pylint: disable=broad-except
+        return []
+    if meta is None:
+        return []
+    names = sorted(meta.indices)
+    transport = conn.transport
+    direct = getattr(transport, "kind", "") == "direct"
+    docs = ""
+    if direct:
+        try:
+            docs = f", {transport.count(index, None):,} documents"
+        except Exception:  # pylint: disable=broad-except
+            docs = ""
+    out = [f"-- {index} reads {len(names)} {'index' if len(names) == 1 else 'indices'}: {_some(names)}{docs}"]
+    others = _family_others(transport, index, set(names))
+    if not others:
+        return out
+    more = ""
+    if len(others) <= 50:
+        try:
+            more = f", {transport.count(','.join(others), None):,} documents"
+        except Exception:  # pylint: disable=broad-except
+            more = ""
+    try:
+        alias = any(kind == "alias" for _n, kind in transport.list_tables([index]))
+    except Exception:  # pylint: disable=broad-except
+        alias = False
+    why = (" An alias does not take the indices created after it: put the alias in the index template "
+           "(its \"aliases\") so that every new index gets it." if alias else "")
+    out.append(f"-- WARNING: {len(others)} {'index' if len(others) == 1 else 'indices'} of the same name (apart from "
+               f"\"-\", \"_\" and \".\") not read by {index}: {_some(others)}{more}.{why} To read every index of "
+               f"the family: FROM \"{_family_pattern(index, others[-1])}\"")
     return out
 
 

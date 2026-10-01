@@ -1,5 +1,16 @@
 # Changes
 
+## 0.2.11 — 2 Oct 2026
+
+**EXPLAIN names the indices a table reads, and the ones of the same family it misses.** Each table of the query
+gets a line with the indices it reads (the first and the last ones) and their documents, and a WARNING when indices
+of the same name (apart from `-`, `_` and `.`) exist that it does not read, with their documents and the pattern
+that reads them all. The production case of 2 October: a table on an alias put on the monthly indices with a
+wildcard, which did not take the index created on 1 October, so the alias had 2 documents of that day where
+Discover, on the index pattern, had 215. The warning also says to put the alias in the index template; see
+DEPLOY.md, *An alias for every new index* (checked on OpenSearch 3.8: a legacy template is ignored when a
+composable one matches). Direct transport only; EXPLAIN only (a query's own rows are unchanged).
+
 ## 0.2.10 — 1 Oct 2026
 
 **`POSITION_LABEL = 'D'` is one position date, today's.** It also asked for the next seven days and every
