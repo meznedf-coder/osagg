@@ -196,7 +196,16 @@ class DirectTransport(Transport):
         return res
 
     def open_pit(self, index: str, keep_alive: str = "2m") -> str | None:
-        res = self._call(self.client.create_pit, index=index, params={"keep_alive": keep_alive})
+        # created on every shard or not at all: a point in time missing shards would page through part of
+        # the documents with every later page answering "0 failed"
+        res = self._call(self.client.create_pit, index=index,
+                         params={"keep_alive": keep_alive, "allow_partial_pit_creation": "false"})
+        try:
+            check_complete(res, index)
+        except PartialResults:
+            if res.get("pit_id"):
+                self.close_pit(res["pit_id"])
+            raise
         return res.get("pit_id")
 
     def close_pit(self, pit_id: str) -> None:

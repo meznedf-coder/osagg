@@ -45,6 +45,13 @@ the other shards hold. osagg returned those partial counts. Searches now ask for
 (`allow_partial_search_results=false`), and any answer with failed shards or a timeout raises an error
 naming the shards and the reason; busy shards are retried first. This applies through Trino as well.
 In the lab, OpenSearch counted 1,200 of 1,210 documents with one shard failed, and 0.2.7 returned 1,200.
+Points in time (deep reads beyond 10,000 rows) are created on every shard or not at all
+(`allow_partial_pit_creation=false`): one created on part of the shards would answer every page with no
+failed shard while documents are missing.
+
+**Upgrading.** A chart whose answers were silently partial (for example an index of a pattern whose
+mapping makes a shard fail) now shows an error naming the shards and the reason instead of a smaller
+number. That error is the place to fix the mapping or the query.
 
 ## 0.2.7 — 30 Sep 2026
 

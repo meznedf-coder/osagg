@@ -347,3 +347,31 @@ def test_the_direct_transport_asks_for_all_shards_and_retries_a_busy_one(monkeyp
     t.client = Client()
     assert t.search("jobs-*", {"size": 0})["hits"]["total"]["value"] == 7
     assert len(seen) == 2 and all(p["allow_partial_search_results"] == "false" for p in seen)
+
+
+def test_a_point_in_time_is_created_on_every_shard_or_not_at_all():
+    """Deep reads page through a point in time: one created on part of the shards answers every page with
+    "0 failed" while documents are missing."""
+    from osagg import transport as T
+
+    seen, closed = [], []
+
+    class Client:
+        def __init__(self, answer):
+            self.answer = answer
+
+        def create_pit(self, **kw):
+            seen.append(kw["params"])
+            return self.answer
+
+        def delete_pit(self, body):
+            closed.append(body)
+
+    t = T.DirectTransport()
+    t.client = Client({"pit_id": "p1", "_shards": {"total": 3, "successful": 3, "failed": 0}})
+    assert t.open_pit("jobs-*") == "p1" and seen[0]["allow_partial_pit_creation"] == "false"
+    t.client = Client({"pit_id": "p2", "_shards": {"total": 3, "successful": 2, "failed": 1, "failures": [
+        {"reason": {"type": "node_disconnected_exception", "reason": "gone"}}]}})
+    with pytest.raises(T.PartialResults, match="1 of the 3 shards"):
+        t.open_pit("jobs-*")
+    assert closed == [{"pit_id": ["p2"]}]
