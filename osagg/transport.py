@@ -83,6 +83,10 @@ class Transport:
         res = self.search(index, body)
         return int(res["hits"]["total"]["value"])
 
+    def msearch(self, indices: list[str], bodies: list[dict]) -> list[dict]:
+        """Several searches (one per index and body), each answer complete or an error."""
+        return [self.search(i, b) for i, b in zip(indices, bodies)]
+
     def open_pit(self, index: str, keep_alive: str = "2m") -> str | None:
         return None
 
@@ -194,6 +198,24 @@ class DirectTransport(Transport):
         logger.debug("search %s took=%sms wall=%.0fms", index, res.get("took"),
                      (time.perf_counter() - t0) * 1000)
         return res
+
+    def msearch(self, indices: list[str], bodies: list[dict]) -> list[dict]:
+        """Several searches in one request (the metadata probes): each answer checked as a search's."""
+        if not bodies:
+            return []
+        lines: list[dict] = []
+        for index, body in zip(indices, bodies):
+            lines += [{"index": index}, body]
+        # (_msearch takes no allow_partial_search_results: each answer's _shards is checked below)
+        res = self._call(self.client.msearch, body=lines, params={"request_timeout": self.request_timeout})
+        out = []
+        for index, r in zip(indices, res.get("responses") or []):
+            if "error" in r:
+                raise OperationalError(f"OpenSearch error on {index}: {r['error']}")
+            out.append(check_complete(r, index))
+        if len(out) != len(bodies):
+            raise OperationalError("OpenSearch answered fewer searches than were sent")
+        return out
 
     def open_pit(self, index: str, keep_alive: str = "2m") -> str | None:
         # created on every shard or not at all: a point in time missing shards would page through part of

@@ -557,6 +557,7 @@ class Cursor:
         except sqlglot.errors.ParseError as ex:
             raise ProgrammingError(f"SQL syntax error: {ex}") from ex
         rows: list[tuple] = []
+        named = {c.name for c in stmt.find_all(exp.Column) if c.name}     # before planning rewrites it
         if analyze:
             self._execute_one(stmt)
             plan = self.last_plan
@@ -564,7 +565,11 @@ class Cursor:
         else:
             plan = self.plan(stmt)
             stats = {}
-        lines: list[str] = []
+        from osagg import __version__
+
+        lines: list[str] = [f"-- osagg {__version__}, {self.connection.transport.kind} transport, time zone "
+                            f"{self.connection.tz}"]
+        lines += _fields_read(named, plan, self.connection.table_meta)
         for i, scan in enumerate(_run_order(plan.scans), 1):
             st = stats.get(scan.table)
             mode = getattr(scan, "mode", "")
@@ -587,6 +592,49 @@ class Cursor:
             rows.append(("\u00a0" * (len(line) - len(stripped)) + stripped,))
         self._set_result([("plan", "VARCHAR")], rows)
         return self
+
+
+def _field_kind(f: Any) -> str:
+    """How osagg reads a field, in a few words (EXPLAIN)."""
+    if f.virtual:
+        return f"computed ({f.virtual})"
+    if f.is_text:
+        out = "text" + (f" + exact {f.agg_field}" if f.agg_field else " (no exact sub-field)")
+        if f.exact_max:
+            out += f", ignore_above {f.exact_max}" + (": some values longer, read from the documents"
+                                                     if f.long_values else "")
+        return out
+    out = f.os_type
+    if f.is_date:
+        out += f" {f.date_format}" if f.date_format else " (default format)"
+        if f.date_only:
+            out += ", calendar days (UTC)" + (" (values all at 00:00 UTC)" if f.midnight else "")
+    return out
+
+
+def _fields_read(names: set[str], plan: Any, lookup: Any) -> list[str]:
+    """For each index of the plan, how the fields the query names are read there (per group of indices for a
+    field the indices map differently): what a count that differs from Discover's is checked against first."""
+    out: list[str] = []
+    for index in dict.fromkeys(getattr(s, "index", None) for s in plan.scans):
+        meta = lookup(index) if index else None
+        if meta is None:
+            continue
+        rows = []
+        for name in sorted(names):
+            f = meta.fields.get(name)
+            if f is None:
+                continue
+            if f.variants:
+                parts = [f"{_field_kind(v)} in {len(ix)} ({', '.join(sorted(ix)[:3])}{', …' if len(ix) > 3 else ''})"
+                         for ix, v in f.variants]
+                rows.append(f"--    {name}: mapped differently: " + "; ".join(parts))
+            else:
+                rows.append(f"--    {name}: {_field_kind(f)}")
+        if rows:
+            out.append(f"-- fields of {index} ({len(meta.indices)} indices):")
+            out += rows
+    return out + [""] if out else out
 
 
 def _is_false(node: exp.Expression) -> bool:

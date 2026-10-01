@@ -1,5 +1,19 @@
 # Changes
 
+## 0.2.9 — 1 Oct 2026
+
+**Faster metadata (0.2.8 could take tens of seconds on big indices).** 0.2.8 looked for text values longer than
+their keyword by filtering the documents that have the text but not the keyword: every document of the
+pattern was read for each text field, at every load of a table's metadata (every 5 minutes in each Superset
+process). It now compares two counts per field (documents with the text, with the keyword), which OpenSearch
+answers from its index statistics: 20 ms instead of 223 ms per field on a lab index of 10 million documents,
+and the cost no longer grows with the number of documents. All the counts go in one request.
+
+**EXPLAIN says what to check first** when a count differs from Discover's: the version of osagg, the transport
+and the time zone, then, for each index pattern, how each field the query names is read there (keyword, text
+with its exact sub-field, a date's format and whether it holds calendar days, a field mapped differently in
+each group of indices, values longer than the keyword).
+
 ## 0.2.8 — 1 Oct 2026
 
 Counts that were silently wrong, found while reviewing a production count far below what Discover

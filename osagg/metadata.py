@@ -512,9 +512,12 @@ def _indices_of(index: str, ix: tuple) -> str:
 def probe_long_values(transport: Transport, index: str, fields: dict[str, Field]) -> dict[str, Field]:
     """Text fields whose keyword sub-field has ignore_above (256 in OpenSearch's dynamic mapping): documents
     whose value is longer have the text but not the keyword, which exact filters, groups and counts read (a
-    long error description counted as NULL). One request counts them per field (per group of indices for
-    a field the indices map differently); a field with some is read from the documents where it must be
-    exact (long_values)."""
+    long error description counted as NULL). Found by comparing two counts per field (per group of indices
+    for a field the indices map differently): documents with the text, documents with the keyword. Counting
+    the documents that have a field is answered from the index statistics (milliseconds at any size), where
+    filtering the documents that have the one but not the other read them all (seconds per field on a big
+    index, at every load of the metadata). A field with fewer keywords than texts is read from the documents
+    where it must be exact (long_values); so are documents indexed before the keyword sub-field existed."""
     cands: list[tuple[str, Field, int | None, tuple]] = []
     for f in fields.values():
         if f.virtual:
@@ -528,25 +531,28 @@ def probe_long_values(transport: Transport, index: str, fields: dict[str, Field]
     cands = cands[:PROBE_FIELDS]
     if not cands:
         return fields
-    aggs = {}
-    for i, (_, f, _, ix) in enumerate(cands):
-        q: dict = {"bool": {"filter": [{"exists": {"field": f.name}}],
-                            "must_not": [{"exists": {"field": f.agg_field}}]}}
-        if ix:
-            q["bool"]["filter"].append({"terms": {"_index": list(ix)}})
-        aggs[f"l{i}"] = {"filter": q}
+    bodies = []
+    for _, f, _, _ in cands:
+        for name in (f.name, f.agg_field):
+            bodies.append({"size": 0, "track_total_hits": True, "query": {"exists": {"field": name}}})
     try:
-        res = transport.search(index, {"size": 0, "track_total_hits": False, "aggs": aggs})
+        targets = [_indices_of(index, ix) for _, _, _, ix in cands for _ in (0, 1)]
+        answers = transport.msearch(targets, bodies)
     except Exception:  # pylint: disable=broad-except
         logger.debug("osagg: the probe of the long text values of %s failed", index, exc_info=True)
         return fields
     out = dict(fields)
     for i, (name, f, pos, ix) in enumerate(cands):
-        n = ((res.get("aggregations") or {}).get(f"l{i}") or {}).get("doc_count") or 0
-        if not n:
+        try:
+            n_text = int(answers[2 * i]["hits"]["total"]["value"])
+            n_exact = int(answers[2 * i + 1]["hits"]["total"]["value"])
+        except (KeyError, TypeError, ValueError, IndexError):
             continue
-        logger.info("osagg: %s of %s: %d document(s) longer than its keyword's %d characters", name,
-                    index if not ix else f"{len(ix)} of the indices of {index}", n, f.exact_max)
+        if n_text <= n_exact:
+            continue
+        logger.info("osagg: %s of %s: %d document(s) without its keyword (longer than %d characters, or indexed "
+                    "before it): read from the documents where it must be exact", name,
+                    index if not ix else f"{len(ix)} of the indices of {index}", n_text - n_exact, f.exact_max)
         if pos is None:
             out[name] = dataclasses.replace(f, long_values=True)
         else:

@@ -227,14 +227,19 @@ def plan_of(meta: TableMeta, sql: str):
 
 
 class CountingTransport:
+    """Counts of the documents that have a field (per index target), as OpenSearch's statistics answer them."""
     kind = "direct"
 
-    def __init__(self, counts: list[int]):
-        self.counts, self.bodies = counts, []
+    def __init__(self, counts: dict[str, int]):
+        self.counts, self.asked = counts, []
 
-    def search(self, index, body, timeout=None):
-        self.bodies.append(body)
-        return {"aggregations": {n: {"doc_count": c} for n, c in zip(body["aggs"], self.counts)}}
+    def msearch(self, indices, bodies):
+        out = []
+        for index, body in zip(indices, bodies):
+            field = body["query"]["exists"]["field"]
+            self.asked.append((index, field, body.get("track_total_hits")))
+            out.append({"hits": {"total": {"value": self.counts.get(field, 0)}}})
+        return out
 
 
 def test_a_text_whose_keyword_has_ignore_above_is_probed_for_longer_values():
@@ -243,12 +248,13 @@ def test_a_text_whose_keyword_has_ignore_above_is_probed_for_longer_values():
     count read."""
     meta = table(LONG)
     assert meta.fields["MSG"].exact_max == 32 and not meta.fields["MSG"].long_values
-    t = CountingTransport([3])
+    t = CountingTransport({"MSG": 50, "MSG.keyword": 47})
     probed = probe_long_values(t, "jobs-*", meta.fields)
     assert probed["MSG"].long_values
-    assert t.bodies[0]["aggs"]["l0"] == {"filter": {"bool": {"filter": [{"exists": {"field": "MSG"}}],
-                                                             "must_not": [{"exists": {"field": "MSG.keyword"}}]}}}
-    assert not probe_long_values(CountingTransport([0]), "jobs-*", meta.fields)["MSG"].long_values
+    # two counts of the documents that have each field (index statistics: no document read, unlike a filter)
+    assert t.asked == [("jobs-*", "MSG", True), ("jobs-*", "MSG.keyword", True)]
+    assert not probe_long_values(CountingTransport({"MSG": 50, "MSG.keyword": 50}), "jobs-*",
+                                 meta.fields)["MSG"].long_values
 
 
 def test_values_longer_than_the_keyword_are_read_from_the_documents():
@@ -297,9 +303,9 @@ def test_a_long_literal_is_looked_for_even_before_the_probe_saw_one():
 
 def test_a_text_long_in_some_indices_of_a_pattern_is_probed_and_compared_per_group():
     meta = table({"jobs-a": LONG["jobs-a"], "jobs-b": {"MSG": {"type": "keyword"}}})
-    t = CountingTransport([2])
+    t = CountingTransport({"MSG": 12, "MSG.keyword": 10})
     fields = probe_long_values(t, "jobs-*", meta.fields)
-    assert {"terms": {"_index": ["jobs-a"]}} in t.bodies[0]["aggs"]["l0"]["filter"]["bool"]["filter"]
+    assert {index for index, _f, _t in t.asked} == {"jobs-a"}          # that group's indices only
     assert fields["MSG"].long_values and [v.long_values for _, v in fields["MSG"].variants] == [True, False]
     meta.fields["MSG"] = fields["MSG"]
     p = plan_of(meta, f"SELECT COUNT(*) FROM \"jobs-*\" WHERE \"MSG\" = '{A_LONG}'")
@@ -375,3 +381,42 @@ def test_a_point_in_time_is_created_on_every_shard_or_not_at_all():
     with pytest.raises(T.PartialResults, match="1 of the 3 shards"):
         t.open_pit("jobs-*")
     assert closed == [{"pit_id": ["p2"]}]
+
+
+def test_explain_says_the_version_and_how_each_field_is_read():
+    """What a count that differs from Discover's is checked against first: osagg's version, the transport, and how
+    each field the query names is read in each group of indices."""
+    from osagg.dbapi import _field_kind, _fields_read
+
+    meta = table({**MIXED, "jobs-c": {"STATUS_INFO": {"type": "keyword"}, "POSITION_DATE": {"type": "long"}}})
+    meta.fields["MSG"] = dataclasses.replace(long_table().fields["MSG"])
+
+    class P:
+        scans = [type("S", (), {"index": "jobs-*"})()]
+
+    lines = _fields_read({"STATUS_INFO", "POSITION_DATE", "MSG", "nothing"}, P(), lambda name: meta)
+    text = "\n".join(lines)
+    assert "-- fields of jobs-* (3 indices):" in text
+    assert "STATUS_INFO: mapped differently: text + exact STATUS_INFO.keyword in 1 (jobs-a); keyword in 2" in text
+    assert "date yyyyMMdd, calendar days (UTC) in 1 (jobs-a)" in text and "long in 1 (jobs-c)" in text
+    assert "ignore_above 32: some values longer, read from the documents" in text and "nothing" not in text
+    assert _field_kind(table(DAYS).fields["RUNS"]) == "long"
+
+
+def test_the_direct_transport_sends_the_probes_in_one_request():
+    from osagg import transport as T
+
+    sent = []
+
+    class Client:
+        def msearch(self, **kw):
+            sent.append(kw)
+            return {"responses": [{"_shards": {"total": 1, "failed": 0}, "hits": {"total": {"value": 5}}},
+                                  {"_shards": {"total": 1, "failed": 1, "failures": [{"reason": {"type": "x", "reason": "y"}}]},
+                                   "hits": {"total": {"value": 3}}}]}
+
+    t = T.DirectTransport()
+    t.client = Client()
+    with pytest.raises(T.PartialResults):                      # a partial answer among them: an error too
+        t.msearch(["a", "b"], [{"size": 0}, {"size": 0}])
+    assert len(sent) == 1 and sent[0]["body"][0] == {"index": "a"} and "allow_partial_search_results" not in sent[0]["params"]
