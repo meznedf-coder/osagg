@@ -12,6 +12,7 @@ cannot be expressed in OpenSearch; the planner then evaluates it in DuckDB.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import math
 import re
@@ -21,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 from sqlglot import exp
 
+from osagg.errors import ProgrammingError
 from osagg.metadata import Field, TableMeta
 
 EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
@@ -60,12 +62,50 @@ class Ctx:
     cardinality_precision: int = 3000
     percentile_compression: int = 500
     allow_shift_offset: bool = False           # Sunday weeks via ES offset (approximate on DST days)
+    overrides: dict | None = None              # a field as one group of indices maps it (variants)
 
     def field_of(self, node: exp.Expression) -> Field | None:
         if isinstance(node, exp.Column):
             if node.table and node.table not in self.qualifiers:
                 return None
-            return self.meta.resolve(node.name)
+            f = self.meta.resolve(node.name)
+            if f is not None and self.overrides and f.name in self.overrides:
+                return self.overrides[f.name]
+            return f
+        return None
+
+    def with_fields(self, views: dict[str, Field]) -> "Ctx":
+        return dataclasses.replace(self, overrides={**(self.overrides or {}), **views})
+
+
+UTC = ZoneInfo("UTC")
+
+
+def zone_of(f: Field | None, tz: ZoneInfo) -> ZoneInfo:
+    """The zone a date field's values and literals are read in: UTC for a date-only field (calendar
+    days, stored at 00:00 UTC: '2026-10-01' is that day whatever the connection's zone), else the
+    connection's zone."""
+    return UTC if f is not None and f.date_only else tz
+
+
+def _as_day(value: Any, f: Field) -> dt.date | None:
+    """A literal written as the date-only field writes its days: 20261001 or '20261001' for yyyyMMdd,
+    '01/10/2026' for dd/MM/yyyy (OpenSearch parses them with the field's format; Discover's filters
+    too). None: not in that form (ISO strings and dates are read as they are)."""
+    pattern = f.date_pattern
+    if pattern is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not value.is_integer():
+            return None
+        text = str(int(value))
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        return None
+    try:
+        return dt.datetime.strptime(text, pattern).date()
+    except ValueError:
         return None
 
 
@@ -152,7 +192,15 @@ def coerce_for_field(value: Any, f: Field, ctx: Ctx) -> Any:
     if value is None:
         return None
     if f.is_date:
-        return to_utc_micros(value, ctx.tz)  # micros; callers convert to ms bounds
+        if f.date_only:                      # a calendar day: 20261001, '20261001', '2026-10-01', in UTC
+            day = _as_day(value, f)
+            if day is not None:
+                value = day
+            elif isinstance(value, (int, float)) and not isinstance(value, bool) \
+                    and "epoch_millis" not in (f.date_format or "strict_date_optional_time||epoch_millis"):
+                raise ProgrammingError(f'{value!r} is not a day of "{f.name}" (a date in format '
+                                       f'{f.date_format}): write it as the field does, or as \'YYYY-MM-DD\'')
+        return to_utc_micros(value, zone_of(f, ctx.tz))  # micros; callers convert to ms bounds
     if f.sql_type == "BOOLEAN":
         if isinstance(value, bool):
             return value
@@ -173,9 +221,10 @@ def coerce_for_field(value: Any, f: Field, ctx: Ctx) -> Any:
                 try:
                     return float(value)
                 except ValueError as ex:
-                    raise Untranslatable(f"not a number: {value!r}") from ex
+                    raise ProgrammingError(f'"{f.name}" is a number ({f.os_type}): {value!r} is not one') from ex
         if isinstance(value, (dt.date, dt.datetime)):
-            raise Untranslatable("date compared with number")
+            raise ProgrammingError(f'"{f.name}" is a number ({f.os_type}), not a date: compare it with a '
+                                   f"number (a day written 20261001 is the number 20261001)")
         return value
     # keyword-ish
     if isinstance(value, bool):
@@ -447,8 +496,9 @@ def _day_range(f: Field, op: str, value: Any, ctx: Ctx) -> dict:
             value = value.date()
     if not isinstance(value, dt.date):
         raise Untranslatable("date comparison with non-date literal")
-    start = to_utc_micros(value, ctx.tz) // 1000
-    nxt = to_utc_micros(value + dt.timedelta(days=1), ctx.tz) // 1000
+    zone = zone_of(f, ctx.tz)
+    start = to_utc_micros(value, zone) // 1000
+    nxt = to_utc_micros(value + dt.timedelta(days=1), zone) // 1000
     if op == "eq":
         return _range(f, {"gte": start, "lt": nxt})
     if op == "gte":
@@ -462,9 +512,38 @@ def _day_range(f: Field, op: str, value: Any, ctx: Ctx) -> dict:
     raise AssertionError(op)
 
 
+def _per_index(node: exp.Expression, ctx: Ctx) -> Pred | None:
+    """A condition on fields the indices map differently, compiled for each group of indices with
+    their own view of those fields (exact field, type, date format), each part restricted to its
+    indices: the documents of every index are compared as that index maps them (as Discover's
+    filters are), never through another index's exact field."""
+    mixed: dict[str, Field] = {}
+    for col in columns_in(node):
+        f = ctx.field_of(col)
+        if f is not None and f.variants and f.name not in (ctx.overrides or {}):
+            mixed[f.name] = f
+    if not mixed:
+        return None
+    cells: dict[tuple, list[str]] = {}
+    for index in ctx.meta.indices:
+        key = tuple(next((v for ix, v in f.variants if index in ix), f.variants[0][1]) for f in mixed.values())
+        cells.setdefault(key, []).append(index)          # an index without the field: NULL there, as any view
+    trues, falses = [], []
+    for key, indices in cells.items():
+        p = predicate(node, ctx.with_fields(dict(zip(mixed, key))))
+        only = {"terms": {"_index": indices}}
+        trues.append(q_and([only, p.true]))
+        falses.append(q_and([only, p.false]))
+    return Pred(true=q_or(trues), false=q_or(falses))
+
+
 def predicate(node: exp.Expression, ctx: Ctx) -> Pred:
     """Compile a WHERE-clause expression. Raises Untranslatable."""
     node = _strip(node)
+    if not isinstance(node, (exp.And, exp.Or, exp.Not)):
+        split = _per_index(node, ctx)
+        if split is not None:
+            return split
 
     if isinstance(node, exp.And):
         a, b = predicate(node.this, ctx), predicate(node.expression, ctx)
@@ -704,6 +783,8 @@ def group_key(node: exp.Expression, ctx: Ctx) -> GroupKey | None:
     node = _strip(node)
     f = ctx.field_of(node)
     if f is not None:
+        if f.name != "_id" and f.agg_field is None and f.variants:
+            return _variant_key(f)
         if f.name == "_id" or f.agg_field is None:
             return None
         return GroupKey({"terms": {"field": f.agg_field, "missing_bucket": True}}, f.sql_type,
@@ -730,7 +811,8 @@ def group_key(node: exp.Expression, ctx: Ctx) -> GroupKey | None:
         f = ctx.field_of(inner)
         if f is None or not f.is_date or unit not in CAL_UNITS:
             return None
-        body: dict[str, Any] = {"field": f.agg_field, "time_zone": str(ctx.tz), "missing_bucket": True}
+        body: dict[str, Any] = {"field": f.agg_field, "time_zone": str(zone_of(f, ctx.tz)),
+                                "missing_bucket": True}
         if unit == "SECOND":
             body["fixed_interval"] = "1s"
         else:
@@ -763,7 +845,7 @@ def group_key(node: exp.Expression, ctx: Ctx) -> GroupKey | None:
         secs = n * UNIT_SECONDS[u]
         if 86400 % secs != 0:
             return None  # DuckDB origin (2000-01-03) alignment only matches for day divisors
-        body = {"field": f.agg_field, "fixed_interval": f"{n}{u}", "time_zone": str(ctx.tz),
+        body = {"field": f.agg_field, "fixed_interval": f"{n}{u}", "time_zone": str(zone_of(f, ctx.tz)),
                 "missing_bucket": True}
         return GroupKey({"date_histogram": body}, "TIMESTAMP", "date_histogram", field=f)
 
@@ -772,7 +854,7 @@ def group_key(node: exp.Expression, ctx: Ctx) -> GroupKey | None:
         f = ctx.field_of(_strip(node.this))
         if f is None or not f.is_date:
             return None
-        body = {"field": f.agg_field, "calendar_interval": "1d", "time_zone": str(ctx.tz),
+        body = {"field": f.agg_field, "calendar_interval": "1d", "time_zone": str(zone_of(f, ctx.tz)),
                 "missing_bucket": True}
         return GroupKey({"date_histogram": body}, "DATE", "date_histogram", as_date=True, field=f)
 
@@ -790,6 +872,24 @@ def group_key(node: exp.Expression, ctx: Ctx) -> GroupKey | None:
                                                    "missing_bucket": True}},
                                     "DOUBLE", "histogram", field=f)
     return None
+
+
+VARIANT_KEY = ("for (String n : params.fields) { if (doc.containsKey(n)) { def d = doc[n]; "
+               "return d.size() == 0 ? null : d.value; } } return null;")
+
+
+def _variant_key(f: Field) -> GroupKey | None:
+    """GROUP BY a field the indices map with different exact fields of one type (text with a keyword
+    sub-field here, keyword there): each document's value from the exact field its index has."""
+    views = [v for _, v in f.variants]
+    if len({v.sql_type for v in views}) != 1 or any(v.agg_field is None for v in views):
+        return None                                   # different types: no common value to group on
+    fields = sorted(dict.fromkeys(v.agg_field for v in views), key=lambda n: -n.count("."))
+    script = {"lang": "painless", "source": VARIANT_KEY, "params": {"fields": fields}}
+    body: dict[str, Any] = {"script": script, "missing_bucket": True}
+    if views[0].sql_type == "VARCHAR":
+        body["value_type"] = "string"
+    return GroupKey({"terms": body}, views[0].sql_type, "terms", field=f)
 
 
 # --------------------------------------------------------------------------- #
@@ -1025,7 +1125,7 @@ def _plain_aggregate(agg: exp.Expression, ctx: Ctx, name: str) -> AggSpec:
         fn = kind.upper()
         if f.is_numeric or f.is_date or f.sql_type == "BOOLEAN":
             n = f"{name}_{kind}"
-            tz = ctx.tz
+            tz = zone_of(f, ctx.tz)
             if f.is_date:
                 ex = lambda b, _n=n: _date_value(b[_n]["value"], tz)  # noqa: E731
                 typ = "TIMESTAMP"

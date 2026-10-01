@@ -94,6 +94,9 @@ class Connection:
         self.percentile_compression = int(kw.get("percentile_compression", 500))
         self.topn = str(kw.get("topn", "exact")).lower()
         self.enum_max_values = int(kw.get("enum_max_values", 10_000))
+        # date fields whose values are all at 00:00 UTC are calendar days (read in UTC): checked once
+        # per table (metadata.probe_midnight_dates); date_probe=false leaves it to their format alone
+        self.date_probe = str(kw.get("date_probe", "true")).lower() in ("1", "true", "yes")
         self.enum_cache_ttl = float(kw.get("enum_cache_ttl", 60))
         self.join_max_keys = int(kw.get("join_max_keys", 100_000))
         # row lists over a join (one big index + small ones): off, set only by extract tools
@@ -190,14 +193,15 @@ class Connection:
         patterns = self.extra_tables or None
         if patterns and any(fnmatch.fnmatchcase(name, p) for p in patterns):
             # inside a configured pattern: the mapping request tells whether it exists
-            return self._with_virtual(CACHE.table(self.cache_key, self.transport, name))
+            return self._with_virtual(CACHE.table(self.cache_key, self.transport, name,
+                                                  date_probe=self.date_probe))
         tables = CACHE.list_tables(self.cache_key, self.transport, patterns)
         if not matches_any(name, tables) and name not in self.extra_tables:
             CACHE.invalidate()
             tables = CACHE.list_tables(self.cache_key, self.transport, patterns)
             if not matches_any(name, tables) and name not in self.extra_tables:
                 return None
-        return self._with_virtual(CACHE.table(self.cache_key, self.transport, name))
+        return self._with_virtual(CACHE.table(self.cache_key, self.transport, name, date_probe=self.date_probe))
 
     def _with_virtual(self, meta: TableMeta | None) -> TableMeta | None:
         """Expose the business-date label column when the index has the source field."""

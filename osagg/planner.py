@@ -35,6 +35,7 @@ from osagg import calendar
 from osagg.errors import ProgrammingError, PushdownError
 from osagg.metadata import SORTABLE_FORMATS, Field, TableMeta
 from osagg.translate import (
+    zone_of,
     MATCH_ALL,
     MATCH_NONE,
     AggSpec,
@@ -933,10 +934,12 @@ class Planner:
         # WHERE
         pushed: list[dict] = []
         residual_preds: list[exp.Expression] = []
+        done: list[exp.Expression] = []
         where = select.args.get("where")
         for c in conjuncts(where.this if where is not None else None):
             try:
                 pushed.append(predicate(c, ctx).true)
+                done.append(c)
             except Untranslatable as ex:
                 residual_preds.append((c, ex))
         residual_preds = self._enumerate_residual(residual_preds, ctx, meta, pushed, notes,
@@ -1011,7 +1014,7 @@ class Planner:
             notes.extend(f"aggregate not pushable: {f}" for f in failed)
         else:
             notes.append("non-decomposable aggregate over non-pushable group keys / filters")
-        return self._fallback_scan(select, table, meta, ctx, pushed, notes)
+        return self._fallback_scan(select, table, meta, ctx, pushed, notes, done)
 
     def _needs_dst_merge(self, keys: list[GroupKey | None]) -> bool:
         """Sub-day buckets in a zone with DST: the repeated local hour yields two buckets
@@ -1292,7 +1295,7 @@ class Planner:
         self._replace_from(new, name)
         return new, scan
 
-    def _fallback_scan(self, select, table, meta, ctx, pushed, notes):
+    def _fallback_scan(self, select, table, meta, ctx, pushed, notes, done=()):
         """Fetch the needed columns of matching documents (capped) and let DuckDB do it all."""
         fields = self._needed_fields(select, ctx)
         name = self._new_table()
@@ -1302,7 +1305,9 @@ class Planner:
         scan = DocScan(table=name, index=meta.name, query=query, fields=fields, sort=None, limit=None,
                        notes=notes)
         new = select.copy()
-        # remove pushed conjuncts? keep all: re-evaluating them is harmless and exact
+        # remove pushed conjuncts? keep all: re-evaluating them is harmless and exact (but on a
+        # field the indices map with different types, which DuckDB cannot compare as one type)
+        _drop_mixed(new, done, ctx)
         self._replace_from(new, name, table.alias)
         return new, scan
 
@@ -1329,10 +1334,12 @@ class Planner:
         fields = self._needed_fields(select, ctx)
         pushed: list[dict] = []
         residual = []
+        done: list[exp.Expression] = []
         where = select.args.get("where")
         for c in conjuncts(where.this if where is not None else None):
             try:
                 pushed.append(predicate(c, ctx).true)
+                done.append(c)
             except Untranslatable as ex:
                 residual.append((c, ex))
         residual = self._enumerate_residual(residual, ctx, meta, pushed, notes, "evaluated in DuckDB")
@@ -1387,6 +1394,7 @@ class Planner:
         scan = DocScan(table=name, index=meta.name, query=query, fields=fields, sort=sort,
                        limit=limit_rows, notes=notes)
         new = select.copy()
+        _drop_mixed(new, done, ctx)
         self._replace_from(new, name, table.alias)
         return new, scan
 
@@ -1550,6 +1558,26 @@ def _yyyymmdd(opts: dict) -> exp.Expression:
     return exp.TimeToStr(this=parsed, format=ymd)
 
 
+def _mixed_types(node: exp.Expression, ctx: Ctx) -> bool:
+    """The condition reads a field the indices map with different types (a date here, a keyword there)."""
+    for col in node.find_all(exp.Column):
+        f = ctx.field_of(col)
+        if f is not None and f.variants and len({v.sql_type for _, v in f.variants}) > 1:
+            return True
+    return False
+
+
+def _drop_mixed(new: exp.Select, done: Any, ctx: Ctx) -> None:
+    """The conditions OpenSearch applied exactly, per index, on fields the indices map with different
+    types, are not evaluated again in DuckDB: their raw values there have no single type."""
+    where = new.args.get("where")
+    drop = {c.sql() for c in done or () if _mixed_types(c, ctx)}
+    if where is None or not drop:
+        return
+    w = and_all([c for c in conjuncts(where.this) if c.sql() not in drop])
+    new.set("where", exp.Where(this=w) if w is not None else None)
+
+
 def _date_source(node: exp.Expression, ctx: Ctx) -> tuple[Field, str, str] | None:
     """Inverse of _yyyymmdd: (field, kind, format) behind a position-date expression."""
     node = _strip(node)
@@ -1675,8 +1703,8 @@ def _preserve_names(orig: list[exp.Expression], new: list[exp.Expression]) -> li
 
 
 def _key_extractor(kname: str, k: GroupKey, ctx: Ctx) -> Callable[[dict], Any]:
-    tz = ctx.tz
     f = k.field
+    tz = zone_of(f, ctx.tz)
     if k.kind == "date_histogram":
         shift = k.shift
         as_date = k.as_date

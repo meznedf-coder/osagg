@@ -312,7 +312,7 @@ class Executor:
                     ms.append(int(x) if isinstance(x, (int, float)) or str(x).lstrip("-").isdigit()
                               else int(float(x)))
             arr = pa.array(ms, pa.int64()).cast(pa.timestamp("ms", tz="UTC"))
-            arr = arr.cast(pa.timestamp("ms", tz=str(self.tz)))
+            arr = arr.cast(pa.timestamp("ms", tz="UTC" if f.date_only else str(self.tz)))   # days: 00:00
             return pc.local_timestamp(arr).cast(pa.timestamp("us"))
         path = f.source_path or f.name
         values = [_source_get(h.get("_source") or {}, path) for h in hits]

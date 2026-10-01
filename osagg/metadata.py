@@ -49,10 +49,30 @@ class Field:
     is_text: bool = False     # analysed text field
     virtual: str | None = None  # "label:<date field>" / "shift:<date field>:<time field>"
     virtual_opts: dict | None = None  # computed columns: source, kind (keyword|date), format, time
+    date_format: str | None = None  # a date field's mapping "format" (None: OpenSearch's default)
+    # the field mapped differently in the indices of a pattern: ((indices, the field as those see it), ...)
+    variants: tuple | None = None
+    midnight: bool = False    # a date field whose values are all at 00:00 UTC (calendar days; see probe)
 
     @property
     def is_date(self) -> bool:
         return self.sql_type == "TIMESTAMP"
+
+    @property
+    def date_only(self) -> bool:
+        """A date field whose values are calendar days (its primary format has no time of day:
+        yyyyMMdd, basic_date, strict_date...): stored at 00:00 UTC, read and compared in UTC, never
+        moved by the connection's time zone."""
+        if not self.is_date:
+            return False
+        if self.variants:
+            return all(v.date_only for _, v in self.variants)
+        return self.midnight or format_is_date_only(self.date_format)
+
+    @property
+    def date_pattern(self) -> str | None:
+        """The strptime pattern of the primary format when it is a plain one (yyyyMMdd, dd/MM/yyyy...)."""
+        return strptime_pattern(self.date_format)
 
     @property
     def is_numeric(self) -> bool:
@@ -64,6 +84,53 @@ class Field:
 
 
 ID_FIELD = Field("_id", "_id", "VARCHAR", agg_field=None, source_path=None)
+
+DATE_ONLY_NAMED = {"date", "strict_date", "basic_date", "strict_basic_date", "year_month_day",
+                   "strict_year_month_day", "year_month", "strict_year_month", "year", "strict_year",
+                   "ordinal_date", "strict_ordinal_date", "basic_ordinal_date", "strict_basic_ordinal_date",
+                   "week_date", "strict_week_date", "basic_week_date", "strict_basic_week_date", "weekyear",
+                   "strict_weekyear", "weekyear_week", "strict_weekyear_week", "weekyear_week_day",
+                   "strict_weekyear_week_day"}
+TIME_LETTERS = set("HhKkmsSnNAaB")          # java.time pattern letters of a time of day
+PLAIN_LETTERS = {"yyyy": "%Y", "uuuu": "%Y", "MM": "%m", "dd": "%d"}
+
+
+def _primary(fmt: str | None) -> str:
+    return (fmt or "").split("||")[0].strip()
+
+
+def format_is_date_only(fmt: str | None) -> bool:
+    """The primary format of a date mapping says a day only (OpenSearch's default does not)."""
+    first = _primary(fmt)
+    if not first:
+        return False
+    if first in DATE_ONLY_NAMED:
+        return True
+    if first.startswith("epoch_") or "_" in first and first.replace("_", "").isalpha():
+        return False                               # epoch_millis, strict_date_optional_time, date_time...
+    outside = re.sub(r"'[^']*'", "", first)      # quoted literals are not pattern letters
+    return not any(ch in TIME_LETTERS for ch in outside) and any(ch in "yudMDw" for ch in outside)
+
+
+def strptime_pattern(fmt: str | None) -> str | None:
+    """yyyyMMdd -> %Y%m%d, dd/MM/yyyy -> %d/%m/%Y, basic_date -> %Y%m%d; None for anything else."""
+    first = _primary(fmt)
+    if first in ("basic_date", "strict_basic_date"):
+        return "%Y%m%d"
+    if first in ("date", "strict_date", "year_month_day", "strict_year_month_day"):
+        return "%Y-%m-%d"
+    out, i = "", 0
+    while i < len(first):
+        for token, code in PLAIN_LETTERS.items():
+            if first.startswith(token, i):
+                out, i = out + code, i + len(token)
+                break
+        else:
+            ch = first[i]
+            if ch.isalpha():
+                return None                        # any other letter: not a plain day pattern
+            out, i = out + ("%%" if ch == "%" else ch), i + 1
+    return out if all(c in out for c in ("%Y", "%m", "%d")) else None
 
 
 @dataclass
@@ -189,14 +256,20 @@ def _walk(props: dict, prefix: str, out: dict[str, Field], aliases: list[tuple[s
         elif ftype == "boolean":
             out[path] = Field(path, ftype, "BOOLEAN", agg_field=path, source_path=path)
         elif ftype in DATE_TYPES:
-            out[path] = Field(path, ftype, "TIMESTAMP", agg_field=path, source_path=path)
+            out[path] = Field(path, ftype, "TIMESTAMP", agg_field=path, source_path=path,
+                              date_format=spec.get("format"))
         else:
             logger.debug("skipping field %s of unsupported type %s", path, ftype)
 
 
 def fields_from_mapping(mapping_response: dict) -> dict[str, Field]:
-    """Merge the mappings of all indices in a GET _mapping response."""
+    """Merge the mappings of all indices in a GET _mapping response. A field the indices map
+    differently (text with a keyword sub-field here, keyword there; a date here, a keyword there;
+    two date formats) keeps each index's own view (`variants`): its conditions are built per
+    group of indices, never from one index's view alone (that index's exact field, missing in the
+    others, made their documents silently match nothing)."""
     merged: dict[str, Field] = {}
+    views: dict[str, dict[str, Field]] = {}
     for index_name in sorted(mapping_response):
         mappings = mapping_response[index_name].get("mappings", {})
         props = mappings.get("properties", {})
@@ -210,15 +283,25 @@ def fields_from_mapping(mapping_response: dict) -> dict[str, Field]:
                                         agg_field=alias_name if t.agg_field == target else t.agg_field,
                                         source_path=t.source_path, is_text=t.is_text)
         for name, f in out.items():
-            prev = merged.get(name)
-            if prev is None:
-                merged[name] = f
-            elif prev.sql_type != f.sql_type or prev.agg_field != f.agg_field:
-                # conflicting definitions across indices: keep the most permissive view
-                logger.warning("field %s has conflicting mappings (%s vs %s)", name, prev, f)
-                if prev.sql_type != f.sql_type:
-                    merged[name] = Field(name, "keyword", "VARCHAR", agg_field=None,
-                                         source_path=f.source_path)
+            views.setdefault(name, {})[index_name] = f
+            merged.setdefault(name, f)
+    for name, per_index in views.items():
+        distinct = list(dict.fromkeys(per_index.values()))
+        if len(distinct) == 1:
+            continue
+        groups = tuple((tuple(sorted(i for i, v in per_index.items() if v == d)), d) for d in distinct)
+        types = {d.sql_type for d in distinct}
+        agg_fields = {d.agg_field for d in distinct}
+        first = distinct[0]
+        logger.info("field %s is mapped differently across the indices: %s", name,
+                    "; ".join(f"{d.os_type}{'/' + d.agg_field if d.agg_field else ''}"
+                              f"{' ' + d.date_format if d.date_format else ''} in {len(ix)}"
+                              for ix, d in groups))
+        merged[name] = Field(name, "mixed" if len(types) > 1 else first.os_type,
+                             first.sql_type if len(types) == 1 else "VARCHAR",
+                             agg_field=next(iter(agg_fields)) if len(agg_fields) == 1 else None,
+                             source_path=first.source_path, is_text=any(d.is_text for d in distinct),
+                             date_format=first.date_format if len(types) == 1 else None, variants=groups)
     return dict(sorted(merged.items()))
 
 
@@ -244,7 +327,9 @@ class MetadataCache:
             self._lists[ckey] = (now + self.ttl, tables)
         return tables
 
-    def table(self, key: str, transport: Transport, name: str, include_id: bool = True) -> TableMeta:
+    def table(self, key: str, transport: Transport, name: str, include_id: bool = True,
+              date_probe: bool = True) -> TableMeta:
+        key = f"{key}|days" if date_probe else key
         now = time.monotonic()
         with self._lock:
             hit = self._tables.get((key, name))
@@ -261,6 +346,8 @@ class MetadataCache:
                                        f"or pattern matches it)")
             indices = sorted(resp)
             fields = fields_from_mapping(resp)
+            if date_probe and not slow:
+                fields = probe_midnight_dates(transport, name, fields)
             if slow:
                 # discovery through Trino samples documents and probes fields (seconds):
                 # share the result between Superset processes through a small disk cache
@@ -297,9 +384,17 @@ def _disk_load(key: str, name: str) -> tuple[list[str], dict[str, Field]] | None
             return None
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-        return list(data["indices"]), {f["name"]: Field(**f) for f in data["fields"]}
+        return list(data["indices"]), {f["name"]: _field_of(f) for f in data["fields"]}
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def _field_of(d: dict) -> Field:
+    """A Field from its JSON form (variants: [[indices], {field}] pairs)."""
+    variants = d.get("variants")
+    if variants:
+        d = {**d, "variants": tuple((tuple(ix), _field_of(v)) for ix, v in variants)}
+    return Field(**d)
 
 
 def _disk_save(key: str, name: str, indices: list[str], fields: dict[str, Field]) -> None:
@@ -335,6 +430,68 @@ def matches_any(name: str, tables: list[tuple[str, str]]) -> bool:
 
 
 _TEXT_ERR = re.compile(r"fielddata=true on \[([^\]]+)\]|Fielddata is disabled on \[?([^\] ]+)\]?")
+
+
+DAY_MS = 86_400_000
+PROBE_FIELDS = 30
+PROBE_GROUPS = 8
+
+
+def probe_midnight_dates(transport: Transport, index: str, fields: dict[str, Field]) -> dict[str, Field]:
+    """Date fields mapped with a format that allows a time of day (OpenSearch's default) but whose
+    values are all at 00:00 UTC ("2026-09-23" written into a date field): calendar days, read and
+    compared in UTC like the date-only formats ('2026-09-23' in a Paris connection is then that
+    day, not 22:00 the day before, which matched nothing). A field is one when its earliest and
+    latest values and the values of a sample of documents are all at midnight UTC; a field the
+    indices map differently is checked per group of indices (each view on its own indices)."""
+    groups: dict[tuple, list[tuple[str, Field, int | None]]] = {}
+    for f in fields.values():
+        if f.virtual:
+            continue
+        if f.variants:
+            for pos, (ix, v) in enumerate(f.variants):
+                if v.is_date and not v.date_only and v.agg_field:
+                    groups.setdefault(tuple(ix), []).append((f.name, v, pos))
+        elif f.is_date and not f.date_only and f.agg_field:
+            groups.setdefault((), []).append((f.name, f, None))
+    out = dict(fields)
+    for ix, cands in list(groups.items())[:PROBE_GROUPS]:
+        cands = cands[:PROBE_FIELDS]
+        aggs: dict = {}
+        for i, (_, f, _) in enumerate(cands):
+            aggs[f"mn{i}"] = {"min": {"field": f.agg_field}}
+            aggs[f"mx{i}"] = {"max": {"field": f.agg_field}}
+        aggs["s"] = {"sampler": {"shard_size": 2000}, "aggs": {
+            f"v{i}": {"terms": {"field": f.agg_field, "size": 200}} for i, (_, f, _) in enumerate(cands)}}
+        body: dict = {"size": 0, "track_total_hits": False, "aggs": aggs}
+        if ix:
+            body["query"] = {"terms": {"_index": list(ix)}}
+        try:
+            res = transport.search(index, body)
+        except Exception:  # pylint: disable=broad-except   (no probe: the format decides alone)
+            logger.debug("osagg: the probe of the date fields of %s failed", index, exc_info=True)
+            continue
+        got = res.get("aggregations") or {}
+        for i, (name, f, pos) in enumerate(cands):
+            values = [got.get(f"mn{i}", {}).get("value"), got.get(f"mx{i}", {}).get("value")]
+            values += [b.get("key") for b in (got.get("s", {}).get(f"v{i}", {}).get("buckets") or [])]
+            values = [v for v in values if v is not None]
+            try:
+                days = len(values) >= 3 and all(int(v) % DAY_MS == 0 for v in values)
+            except (TypeError, ValueError):
+                days = False
+            if not days:
+                continue
+            logger.info("osagg: %s of %s holds calendar days (all at 00:00 UTC): read in UTC", name,
+                        index if not ix else f"{len(ix)} of the indices of {index}")
+            if pos is None:
+                out[name] = dataclasses.replace(f, midnight=True)
+            else:
+                merged = out[name]
+                views = list(merged.variants)
+                views[pos] = (views[pos][0], dataclasses.replace(views[pos][1], midnight=True))
+                out[name] = dataclasses.replace(merged, variants=tuple(views))
+    return out
 
 
 def probe_text_fields(transport: Transport, index: str, fields: dict[str, Field]) -> dict[str, Field]:
