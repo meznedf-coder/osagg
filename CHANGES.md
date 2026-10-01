@@ -1,5 +1,21 @@
 # Changes
 
+## 0.2.10 — 1 Oct 2026
+
+**`POSITION_LABEL = 'D'` is one position date, today's.** It also asked for the next seven days and every
+later date (`terms` with 8 dates and an open range), because the production rule (D-x = the weekdays from the
+date to yesterday) calls every date after today "D". A date after today is now `D+1`, `D+2`... (calendar days),
+so `D` is today's position date alone (and, on a Monday, the weekend before it, which no weekday follows).
+
+**Time bounds read like yours.** A range on a date is written as ISO instants with their offset in the
+connection's zone (`"gte": "2026-09-30T21:00:58.251+02:00", "lt": "2026-10-01T21:00:58.253+02:00",
+"format": "strict_date_optional_time"`; calendar days in UTC): the same instants as the epoch milliseconds
+before, readable in EXPLAIN.
+
+**EXPLAIN fits on the screen.** One row per OpenSearch request (compact JSON) instead of one row per line of
+indented JSON: about 10 rows for a count with three conditions instead of 45. `EXPLAIN VERBOSE` keeps the
+indented form.
+
 ## 0.2.9 — 1 Oct 2026
 
 **Faster metadata (0.2.8 could take tens of seconds on big indices).** 0.2.8 looked for text values longer than

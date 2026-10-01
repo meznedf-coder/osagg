@@ -278,9 +278,9 @@ class Cursor:
         sql = _bind(operation, parameters)
         self._rows, self._pos, self.description, self.rowcount = [], 0, None, -1
         stripped = sql.strip().rstrip(";").strip()
-        m = re.match(r"(?is)^explain(\s+analyze)?\s+(.*)$", stripped)
+        m = re.match(r"(?is)^explain(\s+analyze)?(\s+verbose)?\s+(.*)$", stripped)
         if m:
-            return self._explain(m.group(2), analyze=bool(m.group(1)))
+            return self._explain(m.group(3), analyze=bool(m.group(1)), verbose=bool(m.group(2)))
         if re.match(r"(?is)^show\s+tables\b", stripped):
             self._set_result([("name", "VARCHAR")], [(t,) for t in self.connection.list_tables()])
             return self
@@ -551,7 +551,10 @@ class Cursor:
         self.rowcount = len(rows)
 
     # EXPLAIN ----------------------------------------------------------------
-    def _explain(self, sql: str, analyze: bool) -> "Cursor":
+    def _explain(self, sql: str, analyze: bool, verbose: bool = False) -> "Cursor":
+        """EXPLAIN [ANALYZE] [VERBOSE] <query>. A few rows that SQL Lab shows at once: what osagg read the
+        fields as, each OpenSearch request on one row (compact JSON: open the cell or copy it to read it all),
+        then the DuckDB SQL; VERBOSE writes the requests indented, one JSON line per row."""
         try:
             stmt = sqlglot.parse_one(sql, read="duckdb")
         except sqlglot.errors.ParseError as ex:
@@ -580,10 +583,16 @@ class Cursor:
                              f"{st.os_took_ms} ms, wall {st.wall_ms:.0f} ms")
             for note in scan.notes:
                 lines.append(f"--    note: {note}")
-            lines.extend(json.dumps(scan.describe(), indent=2, default=str).splitlines())
-            lines.append("")
+            if verbose:
+                lines.extend(json.dumps(scan.describe(), indent=2, default=str).splitlines())
+                lines.append("")
+            else:
+                lines.append(json.dumps(scan.describe(), default=str, ensure_ascii=False))
         lines.append(f"-- {len(plan.scans) + 1}. DuckDB, on the rows returned above")
-        lines.extend(plan.residual.sql(dialect="duckdb", pretty=True).splitlines())
+        if verbose:
+            lines.extend(plan.residual.sql(dialect="duckdb", pretty=True).splitlines())
+        else:
+            lines.append(plan.residual.sql(dialect="duckdb"))
         # one line per row reads well in SQL Lab's result grid (like PostgreSQL EXPLAIN);
         # indentation uses no-break spaces because HTML grids collapse normal ones
         rows = []
@@ -632,9 +641,10 @@ def _fields_read(names: set[str], plan: Any, lookup: Any) -> list[str]:
             else:
                 rows.append(f"--    {name}: {_field_kind(f)}")
         if rows:
-            out.append(f"-- fields of {index} ({len(meta.indices)} indices):")
+            n = len(meta.indices)
+            out.append(f"-- fields of {index} ({n} {'index' if n == 1 else 'indices'}):")
             out += rows
-    return out + [""] if out else out
+    return out
 
 
 def _is_false(node: exp.Expression) -> bool:

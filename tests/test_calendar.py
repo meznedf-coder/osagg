@@ -71,7 +71,10 @@ def test_labels_match_the_reference_functions():
             key = calendar.asof_key(now, years=years)
             for back in range(-20, 420):
                 d = (now.date() - dt.timedelta(days=back)).strftime("%Y%m%d")
-                assert calendar.label(d, key) == ref_label(d, now, years), (now, d, years)
+                # the reference (the production function) calls every later date "D"; osagg (0.2.10) keeps
+                # "D" for today's position date and calls the later ones D+1, D+2...
+                want = ref_label(d, now, years) if back >= 0 else f"D+{-back}"
+                assert calendar.label(d, key) == want, (now, d, years)
                 n += 1
     assert n > 40_000
     for v in NOT_DATES + [None]:
@@ -85,14 +88,18 @@ def test_dates_for_labels_is_the_exact_inverse():
         key = calendar.asof_key(now)
         today = now.date()
         window = [(today - dt.timedelta(days=b)).strftime("%Y%m%d") for b in range(-7, 760)]
-        for lbl in labels:
+        for lbl in labels + ["D+1", "D+3", "W+1"]:
             expected = sorted(d for d in window if calendar.label(d, key) == lbl)
             assert calendar.dates_for_labels([lbl], key) == expected, (now, lbl)
-            assert all(ref_label(d, now, True) == lbl for d in expected)
-        # "D" continues after today + 7
-        tail = calendar.open_ended_from(["D", "W-1"], key)
-        assert tail == (today + dt.timedelta(days=8)).strftime("%Y%m%d")
-        assert calendar.label(tail, key) == "D" and calendar.open_ended_from(["W-1"], key) is None
+            assert all(ref_label(d, now, True) == lbl for d in expected if not lbl.startswith("D+"))
+        # "D" is today's position date: one date from Tuesday to Friday (on Monday the weekend before it too,
+        # which no weekday precedes), never the dates after today, and nothing is open-ended any more
+        d_dates = calendar.dates_for_labels(["D"], key)
+        assert today.strftime("%Y%m%d") in d_dates and all(x <= today.strftime("%Y%m%d") for x in d_dates)
+        if today.weekday() in (1, 2, 3, 4):
+            assert d_dates == [today.strftime("%Y%m%d")]
+        assert calendar.dates_for_labels(["D+1"], key) == [(today + dt.timedelta(days=1)).strftime("%Y%m%d")]
+        assert calendar.open_ended_from(["D", "W-1"], key) is None
 
 
 def test_cutoff_weekend_and_label_timezone():
@@ -169,5 +176,5 @@ def test_planner_pushes_aligned_time_ranges_without_any_request():
     assert kinds == ["date_histogram", "terms"]
     q = str(scan.query)
     # W-1 (20260917) is read from 2026-09-17 14:00 Paris = 12:00 UTC
-    assert "'20260917'" in q and str(int(dt.datetime(2026, 9, 17, 12, tzinfo=dt.timezone.utc).timestamp() * 1000)) in q
+    assert "'20260917'" in q and "'2026-09-17T14:00:00.000+02:00'" in q
     con.close()

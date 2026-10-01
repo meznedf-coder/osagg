@@ -279,7 +279,10 @@ def q_and(parts: list[dict]) -> dict:
             prev = ranges.get(fld)
             if prev is not None and prev.get("format") == body.get("format") \
                     and not (set(prev) & set(body)) - {"format"}:
-                prev.update(body)
+                fmt = prev.pop("format", None)
+                prev.update({k: v for k, v in body.items() if k != "format"})
+                if fmt is not None:
+                    prev["format"] = fmt                  # the bounds first, then their format
                 continue
             body = dict(body)
             ranges[fld] = body
@@ -379,10 +382,29 @@ def _ms_bounds(op: str, micros: int) -> tuple[str, int] | None:
     raise AssertionError(op)
 
 
-def _range(f: Field, bounds: dict[str, Any]) -> dict:
+_EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+
+
+def _iso(ms: int, zone: Any) -> str | None:
+    """Epoch milliseconds as an ISO 8601 instant with its offset in `zone` (2026-09-30T21:00:58.251+02:00)."""
+    try:
+        return (_EPOCH + dt.timedelta(milliseconds=int(ms))).astimezone(zone).isoformat(timespec="milliseconds")
+    except (OverflowError, ValueError, TypeError):
+        return None
+
+
+def _range(f: Field, bounds: dict[str, Any], ctx: "Ctx | None" = None) -> dict:
+    """A range on a field. On a date, the bounds are ISO instants with their offset in the field's zone (the
+    connection's, or UTC for calendar days), as people write them, read with strict_date_optional_time
+    whatever the field's own format: the same instants as epoch milliseconds, readable in EXPLAIN."""
     body = dict(bounds)
     if f.is_date:
-        body["format"] = "epoch_millis"
+        zone = zone_of(f, ctx.tz) if ctx is not None else UTC
+        iso = {k: _iso(v, zone) for k, v in body.items()}
+        if all(v is not None for v in iso.values()):
+            body = {**iso, "format": "strict_date_optional_time"}
+        else:                                          # beyond year 9999: as numbers
+            body["format"] = "epoch_millis"
     return {"range": {_exact_field(f): body}}
 
 
@@ -396,7 +418,7 @@ def _cmp(f: Field, op: str, value: Any, ctx: Ctx) -> dict:
         return MATCH_NONE
     if f.is_date:
         op2, ms = _ms_bounds(op, v)
-        return _range(f, {op2: ms})
+        return _range(f, {op2: ms}, ctx)
     return _range(f, {op: v})
 
 
@@ -410,7 +432,7 @@ def _eq(f: Field, value: Any, ctx: Ctx) -> dict:
     if f.is_date:
         if v % 1000:
             return MATCH_NONE  # stored with ms precision
-        return _range(f, {"gte": v // 1000, "lte": v // 1000})
+        return _range(f, {"gte": v // 1000, "lte": v // 1000}, ctx)
     if f.name == "_id":
         return {"ids": {"values": [str(v)]}}
     return {"term": {_exact_field(f): v}}
@@ -544,15 +566,15 @@ def _day_range(f: Field, op: str, value: Any, ctx: Ctx) -> dict:
     start = to_utc_micros(value, zone) // 1000
     nxt = to_utc_micros(value + dt.timedelta(days=1), zone) // 1000
     if op == "eq":
-        return _range(f, {"gte": start, "lt": nxt})
+        return _range(f, {"gte": start, "lt": nxt}, ctx)
     if op == "gte":
-        return _range(f, {"gte": start})
+        return _range(f, {"gte": start}, ctx)
     if op == "gt":
-        return _range(f, {"gte": nxt})
+        return _range(f, {"gte": nxt}, ctx)
     if op == "lt":
-        return _range(f, {"lt": start})
+        return _range(f, {"lt": start}, ctx)
     if op == "lte":
-        return _range(f, {"lt": nxt})
+        return _range(f, {"lt": nxt}, ctx)
     raise AssertionError(op)
 
 

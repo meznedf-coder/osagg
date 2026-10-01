@@ -40,7 +40,7 @@ troubleshooting): [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ```bash
 PY=$(head -1 "$(command -v superset)" | cut -c3-)          # the Python that runs Superset
-$PY -m pip install --upgrade osagg-0.2.9-py3-none-any.whl   # deps: duckdb, opensearch-py, Events
+$PY -m pip install --upgrade osagg-0.2.10-py3-none-any.whl  # deps: duckdb, opensearch-py, Events
 # offline: $PY -m pip install --upgrade --no-index --find-links ./wheelhouse osagg
 $PY -m pip install trino                                     # only for transport=trino
 ```
@@ -124,7 +124,8 @@ fails with a message explaining why, instead of pulling billions of rows.
 ## Business-date labels (POSITION_LABEL)
 
 Indices with a keyword `POSITION_DATE` (yyyymmdd) get a computed column
-`POSITION_LABEL`: `D`, `D-x`, `W-x`, `Y-x` relative to the session date (weekends →
+`POSITION_LABEL`: `D` (today's position date only), `D-x`, `W-x`, `Y-x` relative to the session date, and
+`D+x` for a position date x days after today (weekends →
 Friday, weekdays before 14:00 → previous business day). Filters on it are rewritten to
 `POSITION_DATE`: `=` / `IN` become a `terms` filter on the dates computed from the
 calendar (no extra request), other predicates go through the single-column value
@@ -204,9 +205,13 @@ Everything installs from one offline bundle (`scripts/make_bundle.sh`, `deploy/b
 
 ## EXPLAIN
 
-In SQL Lab: `EXPLAIN SELECT …` shows every OpenSearch request (DSL) and the
-residual DuckDB SQL; `EXPLAIN ANALYZE SELECT …` also runs it and reports rows,
-requests and OpenSearch time per scan.
+In SQL Lab: `EXPLAIN SELECT …` shows, in a few rows, the version of osagg, how each field
+the query names is read (per group of indices when they map it differently), every
+OpenSearch request (one row each, compact JSON: open the cell or copy it) and the residual
+DuckDB SQL; `EXPLAIN VERBOSE` writes the requests indented, `EXPLAIN ANALYZE SELECT …` also
+runs it and reports rows, requests and OpenSearch time per scan. Time bounds are ISO
+instants with their offset (`"gte": "2026-09-30T21:00:58.251+02:00"`), as you would write
+them yourself.
 
 ## Semantics worth knowing
 

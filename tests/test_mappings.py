@@ -27,6 +27,14 @@ def ms(day: str, tz: str = "UTC") -> int:
     return int(d.timestamp() * 1000)
 
 
+def iso(day: str, tz: str = "UTC") -> str:
+    """A bound of a date range as osagg writes it: an ISO instant with its offset in the zone."""
+    return dt.datetime.fromisoformat(day).replace(tzinfo=ZoneInfo(tz)).isoformat(timespec="milliseconds")
+
+
+ISO = "strict_date_optional_time"
+
+
 def table(per_index: dict[str, dict]) -> TableMeta:
     resp = {ix: {"mappings": {"properties": props}} for ix, props in per_index.items()}
     fields = fields_from_mapping(resp)
@@ -64,17 +72,18 @@ def test_a_business_date_stored_as_a_date_is_a_day_in_any_zone(tz):
     """POSITION_DATE = 20261001 was read as epoch milliseconds (1970), '2026-10-01' as midnight in the
     connection's zone (22:00 UTC the day before in Paris): both counted nothing."""
     meta = table(DAYS)
-    day = ms("2026-10-01")
-    eq = {"range": {"POSITION_DATE": {"gte": day, "lte": day, "format": "epoch_millis"}}}
+    day = iso("2026-10-01")
+    eq = {"range": {"POSITION_DATE": {"gte": day, "lte": day, "format": ISO}}}
     for lit in ("20261001", "'20261001'", "'2026-10-01'", "DATE '2026-10-01'"):
         assert query_of(meta, f'"POSITION_DATE" = {lit}', tz) == eq, lit
+    assert day == "2026-10-01T00:00:00.000+00:00"                     # a calendar day: midnight UTC
     assert query_of(meta, "\"POSITION_DATE\" <= '2026-09-30'", tz) == {
-        "range": {"POSITION_DATE": {"lte": ms("2026-09-30"), "format": "epoch_millis"}}}
+        "range": {"POSITION_DATE": {"lte": iso("2026-09-30"), "format": ISO}}}
     assert query_of(meta, "\"POSITION_DATE\" > 20260930", tz) == {
-        "range": {"POSITION_DATE": {"gt": ms("2026-09-30"), "format": "epoch_millis"}}}
-    # a timestamp keeps the connection's zone
+        "range": {"POSITION_DATE": {"gt": iso("2026-09-30"), "format": ISO}}}
+    # a timestamp keeps the connection's zone (its offset written)
     assert query_of(meta, "\"@timestamp_date\" >= '2026-10-01'", tz) == {
-        "range": {"@timestamp_date": {"gte": ms("2026-10-01", tz), "format": "epoch_millis"}}}
+        "range": {"@timestamp_date": {"gte": iso("2026-10-01", tz), "format": ISO}}}
 
 
 def test_a_day_grouped_and_shown_at_midnight():
@@ -119,8 +128,8 @@ def test_each_group_of_indices_is_compared_as_it_maps_the_field():
         {"bool": {"filter": [{"terms": {"_index": ["jobs-b", "jobs-c"]}}, {"term": {"STATUS_INFO": "KO"}}]}}],
         "minimum_should_match": 1}}
     q = json.dumps(query_of(meta, '"POSITION_DATE" = 20261001'))
-    day = ms("2026-10-01")
-    assert f'"gte": {day}, "lte": {day}' in q and '"term": {"POSITION_DATE": "20261001"}' in q \
+    day = iso("2026-10-01")
+    assert f'"gte": "{day}", "lte": "{day}"' in q and '"term": {"POSITION_DATE": "20261001"}' in q \
         and '"term": {"POSITION_DATE": 20261001}' in q                # the date, the keyword, the long
     with pytest.raises(ProgrammingError, match="is a number"):         # the long cannot be a date
         query_of(meta, "\"POSITION_DATE\" = DATE '2026-10-01'")

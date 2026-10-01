@@ -26,4 +26,4 @@ from osagg.dbapi import (  # noqa: F401
 
 from osagg.udf import register_function, registered, unregister_function  # noqa: E402,F401
 
-__version__ = "0.2.9"
+__version__ = "0.2.10"

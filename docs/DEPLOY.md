@@ -7,7 +7,7 @@ upgrade); the lab Superset 6.1 (web server, Celery worker and beat) runs the sam
 against OpenSearch 3.8 and Grafana Mimir 3.2.1. Commands are copy-paste ready; replace the
 values in `<...>`.
 
-**Short path: the bundle.** `osagg-0.2.9-promagg-0.2.2-bundle-py311-linux-x86_64.tar.gz`
+**Short path: the bundle.** `osagg-0.2.10-promagg-0.2.2-bundle-py311-linux-x86_64.tar.gz`
 (38 MB, offline; also in two parts under 30 MB) holds everything: osagg (OpenSearch),
 promagg (Prometheus / Mimir), the packages of Superset 6.1's MCP service, the AI agent and
 its tools service (data dictionary, Excel extracts, chart images, e-mails, reports,
@@ -77,11 +77,11 @@ An LDAP / AD technical account can be mapped to the same role instead of an inte
 
 Files (either one):
 
-* offline, everything: `osagg-0.2.9-promagg-0.2.2-bundle-py311-linux-x86_64.tar.gz` (Python 3.11):
+* offline, everything: `osagg-0.2.10-promagg-0.2.2-bundle-py311-linux-x86_64.tar.gz` (Python 3.11):
   `./install.sh $PY` runs the offline command below;
-* offline: `osagg-0.2.9-wheelhouse-py3XX-linux-x86_64.tar.gz` for your Python version
+* offline: `osagg-0.2.10-wheelhouse-py3XX-linux-x86_64.tar.gz` for your Python version
   (`py310`, `py311` or `py312`, about 22 MB): `osagg`, `duckdb`, `opensearch-py`, `Events`;
-* online: `osagg-0.2.9-py3-none-any.whl` alone, when the host can reach PyPI or your
+* online: `osagg-0.2.10-py3-none-any.whl` alone, when the host can reach PyPI or your
   pip mirror (pip downloads the three dependencies).
 
 ```bash
@@ -91,18 +91,18 @@ PY=/opt/superset/venv/bin/python3.11       # what the line above printed, withou
 $PY --version                              # 3.11 -> the py311 archive
 
 # 2a. Offline: extract the archive and install from its wheelhouse folder
-tar xzf osagg-0.2.9-wheelhouse-py311-linux-x86_64.tar.gz
+tar xzf osagg-0.2.10-wheelhouse-py311-linux-x86_64.tar.gz
 $PY -m pip install --upgrade --no-index --find-links ./wheelhouse osagg
 
 # 2b. Or online (PyPI or company mirror)
-$PY -m pip install --upgrade osagg-0.2.9-py3-none-any.whl
+$PY -m pip install --upgrade osagg-0.2.10-py3-none-any.whl
 
 # 3. Check
-$PY -m pip show osagg | head -2            # Version: 0.2.9
+$PY -m pip show osagg | head -2            # Version: 0.2.10
 ```
 
 Already on 0.2.x: only the new wheel is needed, even offline:
-`$PY -m pip install --upgrade --no-index osagg-0.2.9-py3-none-any.whl`
+`$PY -m pip install --upgrade --no-index osagg-0.2.10-py3-none-any.whl`
 
 If `superset` is not on your PATH, its path is in the `ExecStart=` line of your Superset
 service (`systemctl cat <superset service>`).
@@ -246,8 +246,10 @@ configure.
   functions had no Y rule; `label_years=false` in the URI gives exactly the old
   labels (that date then reads `W-52`).
 * `W-x`: x × 7 days before the session date.
-* `D-x`: x = number of weekdays from the date to yesterday; `D` for today, later dates,
-  and a weekend just before today.
+* `D-x`: x = number of weekdays from the date to yesterday; `D` for today's position date
+  (and a weekend just before today, which no weekday follows).
+* `D+x`: a position date x days after today (osagg 0.2.10; before, they were `D` too, so
+  `POSITION_LABEL = 'D'` also asked for every later date).
 
 Use it like any other column: group by, filters, native filter, drill to detail, SQL
 Lab. osagg turns it into `POSITION_DATE` conditions:
@@ -255,7 +257,7 @@ Lab. osagg turns it into `POSITION_DATE` conditions:
 | You use | OpenSearch receives |
 |---|---|
 | `POSITION_LABEL IN ('D-1', 'W-1')` (native filter, chart filter, SQL) | `terms` on `POSITION_DATE` with the matching dates, computed from the calendar: no extra request |
-| `POSITION_LABEL = 'D'` | the same, plus one small lookup of the dates after today + 7 |
+| `POSITION_LABEL = 'D'` | `term` on today's position date (one date) |
 | `LIKE 'W-%'`, `NOT IN`, `IS NULL` | one small aggregation listing the `POSITION_DATE` values (cached 60 s), then `terms` |
 | `GROUP BY POSITION_LABEL` | composite aggregation on `POSITION_DATE`; DuckDB labels the buckets and merges them |
 | samples, drill to detail, `SELECT *` | the label is computed on the returned rows |

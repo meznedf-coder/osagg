@@ -10,6 +10,8 @@ Rules (same as the production `convert_date_or_label`):
          (only when years are enabled)
     W-x  the date is x*7 days before the session date
     D-x  x = number of weekdays in [date, today - 1]   ("D" when 0)
+    D+x  a position date after today, x calendar days later (osagg, 0.2.10: "D" is one date,
+         today's; the production function also called the later dates "D")
 
 A label as of a given moment is encoded as "<today>/<session>/<Y|->" (e.g.
 "20260925/20260924/Y") so that one query uses one consistent calendar.
@@ -21,7 +23,7 @@ import datetime as dt
 import re
 from functools import lru_cache
 
-_LABEL = re.compile(r"^(D|W|Y)(?:-(\d+))?$")
+_LABEL = re.compile(r"^(D|W|Y)(?:([-+])(\d+))?$")
 
 
 def effective_dates(now: dt.datetime, cutoff: dt.time = dt.time(14, 0)) -> tuple[dt.date, dt.date]:
@@ -69,6 +71,8 @@ def label(date_str: str | None, key: str) -> str | None:
     except ValueError:
         return None
     today, session, years = _parse_key(key)
+    if target > today:                          # a later position date: D+1, D+2... (D is today's only)
+        return f"D+{(target - today).days}"
     delta = (session - target).days
     if years and delta > 0 and delta % 364 == 0:
         return f"Y-{delta // 364}"
@@ -81,10 +85,12 @@ def label(date_str: str | None, key: str) -> str | None:
 def days_back(lbl: str, key: str) -> int | None:
     """Label -> number of calendar days before today (the production Case 2)."""
     m = _LABEL.match(lbl) if isinstance(lbl, str) else None
-    if not m:
+    if not m or (m.group(2) == "+" and m.group(1) != "D"):
         return None
-    kind, num = m.group(1), int(m.group(2) or 0)
+    kind, num = m.group(1), int(m.group(3) or 0)
     today, session, _years = _parse_key(key)
+    if kind == "D" and m.group(2) == "+":
+        return -num                             # later than today
     if kind == "D":
         count = delta = 0
         while count < num:
@@ -98,10 +104,10 @@ def days_back(lbl: str, key: str) -> int | None:
 
 
 def dates_for_labels(labels: list[str], key: str) -> list[str]:
-    """Every yyyymmdd date up to today + 7 whose label is one of `labels` (exact:
-    candidates are the inverse dates +/- a week, each checked with the forward rule;
-    labels are compared as SQL does, case-sensitively). "D" also holds for every date
-    after that, see open_ended_from()."""
+    """Every yyyymmdd date whose label is one of `labels` (exact: candidates are the inverse
+    dates +/- a week, each checked with the forward rule; labels are compared as SQL does,
+    case-sensitively). "D" is today's position date (and, on a Monday, the weekend before it,
+    which no weekday precedes): one date on Tuesday to Friday."""
     wanted = {lbl for lbl in labels if isinstance(lbl, str)}
     today = _parse_key(key)[0]
     out: set[str] = set()
@@ -118,11 +124,10 @@ def dates_for_labels(labels: list[str], key: str) -> list[str]:
 
 
 def open_ended_from(labels: list[str], key: str) -> str | None:
-    """"D" is the label of every date from today on: the first date not covered by
-    dates_for_labels() (today + 8), or None when "D" is not asked for."""
-    if "D" not in labels:
-        return None
-    return (_parse_key(key)[0] + dt.timedelta(days=8)).strftime("%Y%m%d")
+    """No label is open-ended since 0.2.10 (the dates after today are D+1, D+2...): None. Before, "D"
+    held for every date from today on, so `POSITION_LABEL = 'D'` asked for today, the next 7 days
+    and every later date."""
+    return None
 
 
 def anchor(key: str) -> dt.date:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime as dt
+
 import glob
 import json
 import os
@@ -60,11 +62,12 @@ def test_not_in_has_exists_guard(planner):
                                      {"bool": {"must_not": [{"terms": {"POOL": ["A", "B"]}}]}}]}}
 
 
-def test_time_range_epoch_millis_in_timezone(planner):
+def test_time_range_in_the_connection_timezone(planner):
     p = plan(planner, f'SELECT COUNT(*) FROM "{INDEX}" WHERE "@timestamp_date" >= TIMESTAMP \'2026-03-29 03:00:00\'')
     rng = p.scans[0].query["range"]["@timestamp_date"]
-    # 03:00 CEST (first hour of summer time) == 01:00 UTC
-    assert rng == {"gte": 1774746000000, "format": "epoch_millis"}
+    # 03:00 CEST (first hour of summer time) == 01:00 UTC: an ISO instant with its offset, as people write it
+    assert rng == {"gte": "2026-03-29T03:00:00.000+02:00", "format": "strict_date_optional_time"}
+    assert dt.datetime.fromisoformat(rng["gte"]).timestamp() * 1000 == 1774746000000
 
 
 def test_date_histogram_tz_and_two_level_merge(planner):
