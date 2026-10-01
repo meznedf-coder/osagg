@@ -30,7 +30,7 @@ from osagg.errors import (  # noqa: F401  (re-exported)
     PushdownError,
     Warning,
 )
-from osagg.executor import Executor
+from osagg.executor import Executor, NotExact
 from osagg import calendar
 from osagg.metadata import CACHE, TableMeta, matches_any, visible_tables, with_label_column
 from osagg.planner import Plan, Planner, Settings
@@ -97,6 +97,8 @@ class Connection:
         # date fields whose values are all at 00:00 UTC are calendar days (read in UTC): checked once
         # per table (metadata.probe_midnight_dates); date_probe=false leaves it to their format alone
         self.date_probe = str(kw.get("date_probe", "true")).lower() in ("1", "true", "yes")
+        # COUNT(DISTINCT): exact (a sketch while it is exact, else the values as keys), or approx (sketches)
+        self.count_distinct = "approx" if str(kw.get("count_distinct", "exact")).lower() == "approx" else "exact"
         self.enum_cache_ttl = float(kw.get("enum_cache_ttl", 60))
         self.join_max_keys = int(kw.get("join_max_keys", 100_000))
         # row lists over a join (one big index + small ones): off, set only by extract tools
@@ -302,15 +304,16 @@ class Cursor:
             self._execute_one(stmt)
         return self
 
-    def _settings(self) -> Settings:
+    def _settings(self, exact_distinct: bool = False) -> Settings:
         c = self.connection
         return Settings(tz=c.tz, max_scan_rows=c.max_scan_rows, max_buckets_total=c.max_buckets_total,
+                        count_distinct=c.count_distinct, exact_distinct=exact_distinct,
                         cardinality_precision=c.cardinality_precision,
                         percentile_compression=c.percentile_compression, topn=c.topn,
                         enum_max_values=c.enum_max_values, label_key=c.label_key(),
                         join_max_keys=c.join_max_keys, lookup_joins=c.lookup_joins)
 
-    def _planner(self, const_con) -> Planner:
+    def _planner(self, const_con, exact_distinct: bool = False) -> Planner:
         def const_eval(node: exp.Expression) -> Any:
             try:
                 row = const_con.execute("SELECT " + node.sql(dialect="duckdb")).fetchone()
@@ -323,7 +326,7 @@ class Cursor:
         def const_query(sql: str) -> list[tuple]:
             return const_con.execute(sql).fetchall()
 
-        return Planner(self.connection.table_meta, self._settings(), const_eval,
+        return Planner(self.connection.table_meta, self._settings(exact_distinct), const_eval,
                        enumerate_values=self._enumerate_values, const_query=const_query,
                        estimate_keys=self._estimate_keys, count_docs=self._count_docs)
 
@@ -438,11 +441,11 @@ class Cursor:
             raise NotSupportedError(
                 f"Only SELECT queries are supported (got {type(stmt).__name__.upper()})")
 
-    def plan(self, stmt: exp.Expression) -> Plan:
+    def plan(self, stmt: exp.Expression, exact_distinct: bool = False) -> Plan:
         self._check_statement(stmt)
         const_con = duck.locked_session(self.connection.tz_name)
         try:
-            return self._planner(const_con).plan(stmt)
+            return self._planner(const_con, exact_distinct).plan(stmt)
         finally:
             const_con.close()
 
@@ -464,17 +467,16 @@ class Cursor:
                             doc_page_size=c.doc_page_size, request_timeout=c.request_timeout)
         con = duck.new_session(c.tz_name)
         try:
-            self.last_stats = []
-            done: dict[tuple, Any] = {}
-            for scan in _run_order(plan.scans):
-                join = getattr(scan, "join", None)
-                if join and join["push_from"]:
-                    self._push_join_keys(scan, con, done)
-                table, stats = executor.run(scan)
-                con.register(scan.table, table)
-                self.last_stats.append(stats)
-                if join:
-                    done[(join["group"], join["id"])] = scan
+            try:
+                self._run_scans(plan, executor, con)
+            except NotExact as ex:
+                # a COUNT(DISTINCT) sketch reached its threshold (an estimate above): counted exactly
+                logger.info("osagg: %s: counted again exactly", ex)
+                con.close()
+                con = duck.new_session(c.tz_name)
+                plan = self.last_plan = self.plan(stmt, exact_distinct=True)
+                plan.notes.append(f"{ex}: counted exactly (its values as keys)")
+                self._run_scans(plan, executor, con)
             duck.lock(con)
             sql = plan.residual.sql(dialect="duckdb")
             logger.debug("osagg residual SQL: %s", sql)
@@ -490,6 +492,19 @@ class Cursor:
         self._set_result(cols, [_fix_row(r) for r in rows])
         logger.info("osagg query: %d scan(s), %d row(s), %.0f ms", len(plan.scans), len(rows),
                     (time.perf_counter() - t0) * 1000)
+
+    def _run_scans(self, plan: Plan, executor: Executor, con: Any) -> None:
+        self.last_stats = []
+        done: dict[tuple, Any] = {}
+        for scan in _run_order(plan.scans):
+            join = getattr(scan, "join", None)
+            if join and join["push_from"]:
+                self._push_join_keys(scan, con, done)
+            table, stats = executor.run(scan)
+            con.register(scan.table, table)
+            self.last_stats.append(stats)
+            if join:
+                done[(join["group"], join["id"])] = scan
 
     def _answer_without_reading(self, stmt: exp.Expression) -> bool:
         """LIMIT 0 / WHERE FALSE (Superset's column-type probes): run the query in DuckDB on

@@ -146,6 +146,8 @@ class Settings:
     label_key: str | None = None   # business calendar state of this query (osagg.calendar)
     join_max_keys: int = 100_000   # joins: distinct join-key values allowed per index
     lookup_joins: bool = False     # row lists over a join (one big index + small ones): extracts only
+    count_distinct: str = "exact"  # COUNT(DISTINCT): exact, or approx (cardinality sketches, estimates)
+    exact_distinct: bool = False   # this plan counts COUNT(DISTINCT) exactly (its values as keys)
 
 
 # --------------------------------------------------------------------------- #
@@ -506,7 +508,8 @@ class Planner:
             quals.add(table.alias)
         return Ctx(meta=meta, tz=self.settings.tz, qualifiers=quals, const_eval=self.const_eval,
                    cardinality_precision=self.settings.cardinality_precision,
-                   percentile_compression=self.settings.percentile_compression)
+                   percentile_compression=self.settings.percentile_compression,
+                   distinct_mode=self.settings.count_distinct, exact_distinct=self.settings.exact_distinct)
 
     def _new_table(self) -> str:
         return f"{SCAN_PREFIX}{next(self._ids)}"
@@ -974,7 +977,10 @@ class Planner:
 
         decomposable = not failed and all(specs[_key(a)].decomposable for a in agg_nodes)
         dst_merge = all_direct and self._needs_dst_merge([k for _, k in direct_keys])
-        if all_direct and not failed and not (dst_merge and decomposable):
+        distinct_keys = any(specs[_key(a)].distinct_of is not None for a in agg_nodes if _key(a) in specs)
+        if distinct_keys:
+            notes.append("COUNT(DISTINCT) counted exactly: its values are keys of the buckets")
+        if all_direct and not failed and not (dst_merge and decomposable) and not distinct_keys:
             if dst_merge:
                 notes.append("sub-day buckets in a DST time zone: the repeated hour at the end of "
                              "summer time is returned as two rows (non-decomposable aggregate)")
@@ -1226,6 +1232,20 @@ class Planner:
             if k is None:
                 raise Untranslatable(f"cannot bucket {fname} by {g}")
             add_key(exp.column(fname, quoted=True), k)
+        distinct_names: dict[str, exp.Expression] = {}
+        for a in agg_nodes:                      # COUNT(DISTINCT x) counted exactly: x is a key
+            spec = specs[_key(a)]
+            if spec.distinct_of is None:
+                continue
+            f = ctx.field_of(_strip(spec.distinct_of))
+            if f is None:
+                raise Untranslatable(f"COUNT(DISTINCT {spec.distinct_of.sql()}): not a column")
+            col = exp.column(f.name, quoted=True)
+            k = group_key(col, ctx)
+            if k is None:
+                raise Untranslatable(f"COUNT(DISTINCT {f.name}): its values cannot be keys")
+            add_key(col, k)
+            distinct_names[_key(a)] = col
         if not base and group_exprs:
             raise Untranslatable("no pushable group keys")
 
@@ -1241,6 +1261,9 @@ class Planner:
         bucket_aggs = 0
         for i, a in enumerate(agg_nodes):
             spec = specs[_key(a)]
+            if _key(a) in distinct_names:
+                agg_repl[_key(a)] = f'COUNT(DISTINCT "{base_keys[_key(distinct_names[_key(a)])]}")'
+                continue
             aggs.update(spec.aggs)
             bucket_aggs += spec.bucket_aggs
             pnames = []

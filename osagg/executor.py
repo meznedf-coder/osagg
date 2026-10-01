@@ -145,6 +145,7 @@ class Executor:
                 if not page or after is None or len(page) < per_page:
                     break
         stats.rows = len(buckets)
+        _check_exact(scan, buckets)
         arrays = {}
         for col in scan.columns:
             values = [col.extract(b) for b in buckets]
@@ -373,6 +374,22 @@ def _normalize(v: Any, f: Field) -> Any:
         except (TypeError, ValueError):
             return None
     return v
+
+
+class NotExact(Exception):
+    """A COUNT(DISTINCT) sketch reached its precision threshold: above it the value is an estimate."""
+
+
+def _check_exact(scan: Any, buckets: list[dict]) -> None:
+    limits = {n: body["cardinality"].get("precision_threshold", 3000) for n, body in (scan.aggs or {}).items()
+              if n.endswith("_xcard") and "cardinality" in body}
+    if not limits:
+        return
+    for b in buckets:
+        for n, limit in limits.items():
+            v = (b.get(n) or {}).get("value")
+            if v is not None and v >= limit:
+                raise NotExact(f"COUNT(DISTINCT) reached {limit:,} values")
 
 
 def _ambiguous(epoch_ms: Any, tz: ZoneInfo) -> bool:

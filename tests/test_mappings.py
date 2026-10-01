@@ -177,3 +177,32 @@ def test_the_probe_of_a_field_mapped_differently_is_per_group():
     fields = probe_midnight_dates(t, "a,b", meta.fields)
     assert t.bodies[0]["query"] == {"terms": {"_index": ["a"]}}
     assert [v.date_only for _, v in fields["D"].variants] == [True, False]
+
+
+def _planner_with(meta: TableMeta, **kw) -> Planner:
+    con = duck.locked_session("Europe/Paris")
+    return Planner(lambda name: meta if name == "jobs-*" else None, Settings(tz=ZoneInfo("Europe/Paris"), **kw),
+                   lambda node: con.execute("SELECT " + node.sql(dialect="duckdb")).fetchone()[0])
+
+
+def test_count_distinct_is_exact_unless_asked_for_an_estimate():
+    """COUNT(DISTINCT x) was a cardinality sketch (an estimate above 3,000 values). Now a sketch while it is
+    exact; reaching its threshold, the query is counted again with x as a key (DuckDB counts the keys);
+    count_distinct=approx keeps the estimate."""
+    from osagg.executor import NotExact, _check_exact
+
+    meta = table(DAYS)
+    sql = sqlglot.parse_one('SELECT COUNT(DISTINCT "STATUS_INFO") FROM "jobs-*"', read="duckdb")
+    first = _planner_with(meta).plan(sql)
+    assert [n for n in first.scans[0].aggs] == ["a0_xcard"]
+    with pytest.raises(NotExact):
+        _check_exact(first.scans[0], [{"doc_count": 9, "a0_xcard": {"value": 3000}}])
+    _check_exact(first.scans[0], [{"doc_count": 9, "a0_xcard": {"value": 2999}}])      # exact below
+    exact = _planner_with(meta, exact_distinct=True).plan(sql)
+    assert [n for n, _ in exact.scans[0].keys] == ["k0"] and not exact.scans[0].aggs
+    assert 'COUNT(DISTINCT "k0")' in exact.residual.sql(dialect="duckdb")
+    approx = _planner_with(meta, count_distinct="approx").plan(sql)
+    assert [n for n in approx.scans[0].aggs] == ["a0_card"]
+    grouped = _planner_with(meta, exact_distinct=True).plan(sqlglot.parse_one(
+        'SELECT "STATUS_INFO", COUNT(DISTINCT "RUNS"), COUNT(*) FROM "jobs-*" GROUP BY 1', read="duckdb"))
+    assert len(grouped.scans[0].keys) == 2 and "SUM(" in grouped.residual.sql(dialect="duckdb")

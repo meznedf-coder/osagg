@@ -63,6 +63,8 @@ class Ctx:
     percentile_compression: int = 500
     allow_shift_offset: bool = False           # Sunday weeks via ES offset (approximate on DST days)
     overrides: dict | None = None              # a field as one group of indices maps it (variants)
+    distinct_mode: str = "exact"               # COUNT(DISTINCT): exact (default) or approx (sketches)
+    exact_distinct: bool = False               # COUNT(DISTINCT) counted exactly (its values as keys)
 
     def field_of(self, node: exp.Expression) -> Field | None:
         if isinstance(node, exp.Column):
@@ -914,6 +916,7 @@ class AggSpec:
     bucket_aggs: int = 0          # number of bucket-creating sub-aggs (filter/terms), for max_buckets
     heavy: int = 0                # memory-heavy sub-aggs (cardinality, percentiles): smaller pages
     order_path: str | None = None  # terms "order" path for approximate top-N
+    distinct_of: Any = None       # COUNT(DISTINCT x) counted exactly: x becomes a key, DuckDB counts it
 
 
 def _val(name: str) -> Callable[[dict], Any]:
@@ -1063,9 +1066,16 @@ def _plain_aggregate(agg: exp.Expression, ctx: Ctx, name: str) -> AggSpec:
             if len(exprs) != 1:
                 raise Untranslatable("COUNT(DISTINCT a, b)")
             f = _num_field(exprs[0], ctx)
-            if f.agg_field is None:
+            if f.agg_field is None and not f.variants:
                 raise Untranslatable(f"COUNT(DISTINCT {f.name}): field is not aggregatable")
-            n = f"{name}_card"
+            if ctx.exact_distinct and ctx.distinct_mode != "approx":
+                # exact: the values become keys of the buckets, DuckDB counts them
+                return AggSpec("BIGINT", {}, lambda b: None, True, [], "", distinct_of=exprs[0])
+            if f.agg_field is None:
+                raise Untranslatable(f"COUNT(DISTINCT {f.name}): mapped differently across the indices")
+            # a sketch, exact below its precision threshold: "_xcard" ones are checked (executor) and the
+            # query counted again exactly when one reaches it (dbapi); "_card" (approx mode): an estimate
+            n = f"{name}_card" if ctx.distinct_mode == "approx" else f"{name}_xcard"
             body = {"cardinality": {"field": f.agg_field,
                                     "precision_threshold": ctx.cardinality_precision}}
             return AggSpec("BIGINT", {n: body}, _val(n), heavy=1, order_path=n)
