@@ -395,7 +395,7 @@ class Cursor:
         Cached for `enum_cache_ttl` seconds: every chart of a dashboard that filters on
         the same label asks the same question."""
         ttl = self.connection.enum_cache_ttl
-        key = (self.connection.cache_key, index, f.agg_field, limit,
+        key = (self.connection.cache_key, index, f.agg_field or f.name, limit,
                json.dumps(query, sort_keys=True, default=str))
         if ttl > 0:
             hit = _ENUM_CACHE.get(key)
@@ -409,9 +409,15 @@ class Cursor:
         return values
 
     def _enumerate_values_uncached(self, index: str, query: dict, f: Any, limit: int) -> list | None:
-        comp: dict[str, Any] = {"size": min(limit + 1, 10_000),
-                                "sources": [{"v": {"terms": {"field": f.agg_field,
-                                                             "missing_bucket": True}}}]}
+        source: dict[str, Any] = {"terms": {"field": f.agg_field, "missing_bucket": True}}
+        if f.agg_field is None and f.variants:          # text here, keyword there: each index's exact field
+            from osagg.translate import _variant_key
+
+            key = _variant_key(f)
+            if key is None:
+                return None
+            source = key.source
+        comp: dict[str, Any] = {"size": min(limit + 1, 10_000), "sources": [{"v": source}]}
         body = {"size": 0, "track_total_hits": False, "query": query,
                 "aggs": {"e": {"composite": comp}}}
         values: list[Any] = []

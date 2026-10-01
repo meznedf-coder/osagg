@@ -201,9 +201,11 @@ def with_label_column(meta: TableMeta, source: str | None, column: str,
     if picked is None:
         return meta
     src, fmt = picked
+    text_here_keyword_there = bool(src.variants) and all(v.sql_type == "VARCHAR" and v.agg_field
+                                                         for _, v in src.variants)
     if src.is_date:
         kind = "date"
-    elif src.sql_type == "VARCHAR" and src.agg_field is not None:
+    elif src.sql_type == "VARCHAR" and (src.agg_field is not None or text_here_keyword_there):
         kind = "keyword"
     else:
         return meta

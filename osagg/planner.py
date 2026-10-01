@@ -638,9 +638,10 @@ class Planner:
         elif tail is not None:
             if self.enumerate_values is None or fmt not in SORTABLE_FORMATS:
                 return None
-            later = self.enumerate_values(ctx.meta.name, q_and([base_query, {"range": {
-                f.agg_field: {"gte": _ymd_date(tail).strftime(fmt)}}}]), f,
-                self.settings.enum_max_values)
+            since = predicate(exp.GTE(this=exp.column(f.name, quoted=True),
+                                      expression=exp.Literal.string(_ymd_date(tail).strftime(fmt))), ctx).true
+            later = self.enumerate_values(ctx.meta.name, q_and([base_query, since]), f,
+                                          self.settings.enum_max_values)
             if later is None:
                 return None
             extra = [d for d in (_to_ymd(v, fmt) for v in later)
@@ -660,7 +661,7 @@ class Planner:
     def _dates_query(self, f: Field, kind: str, fmt: str, dates: list[str], ctx: Ctx) -> dict:
         """Documents whose position date is one of `dates` (yyyymmdd)."""
         if kind == "keyword":
-            return _in_values(f, [_ymd_date(d).strftime(fmt) for d in dates])
+            return _in_values(f, [_ymd_date(d).strftime(fmt) for d in dates], ctx)
         # date field: one range per run of consecutive days
         days = sorted(_ymd_date(d) for d in dates)
         runs: list[list[dt.date]] = []
@@ -829,7 +830,7 @@ class Planner:
         if len(fields) != 1:
             return None
         f = next(iter(fields.values()))
-        if f.agg_field is None or f.is_date or f.name == "_id":
+        if (f.agg_field is None and not _same_kind_text(f)) or f.is_date or f.name == "_id":
             return None
         values = self.enumerate_values(meta.name, base_query, f, self.settings.enum_max_values)
         if values is None:
@@ -866,7 +867,7 @@ class Planner:
             self._pd_dates[f.name] = ymd if prev is None else prev & ymd
         parts: list[dict] = []
         if non_null:
-            parts.append(_in_values(f, non_null))
+            parts.append(_in_values(f, non_null, ctx))
         if len(non_null) != len(matched):
             parts.append(q_not(q_exists(f)))
         notes.append(f"filter {c.sql(dialect='duckdb')[:120]} -> {f.name} IN "
@@ -1457,12 +1458,20 @@ def _replaceable(node: exp.Expression) -> bool:
     return True
 
 
-def _in_values(f: Field, values: list[Any]) -> dict:
-    fld = f.agg_field
+def _in_values(f: Field, values: list[Any], ctx: Ctx | None = None) -> dict:
     uniq = list(dict.fromkeys(values))
+    if f.variants and ctx is not None:               # mapped differently across the indices: per index
+        lits = [exp.Literal.string(str(v)) if isinstance(v, str) else exp.Literal.number(v) for v in uniq]
+        return predicate(exp.In(this=exp.column(f.name, quoted=True), expressions=lits), ctx).true
+    fld = f.agg_field
     if len(uniq) == 1:
         return {"term": {fld: uniq[0]}}
     return {"terms": {fld: uniq}}
+
+
+def _same_kind_text(f: Field) -> bool:
+    """A field the indices map as text here, keyword there (each with an exact field): one kind of value."""
+    return bool(f.variants) and all(v.sql_type == "VARCHAR" and v.agg_field for _, v in f.variants)
 
 
 def _has_dst(tz) -> bool:
@@ -1583,7 +1592,8 @@ def _date_source(node: exp.Expression, ctx: Ctx) -> tuple[Field, str, str] | Non
     node = _strip(node)
     if isinstance(node, exp.Column):
         f = ctx.field_of(node)
-        if f is not None and f.agg_field is not None and not f.virtual and f.sql_type == "VARCHAR":
+        if f is not None and (f.agg_field is not None or _same_kind_text(f)) and not f.virtual \
+                and f.sql_type == "VARCHAR":
             return f, "keyword", "%Y%m%d"
         return None
     if isinstance(node, exp.TimeToStr):
@@ -1599,7 +1609,7 @@ def _date_source(node: exp.Expression, ctx: Ctx) -> tuple[Field, str, str] | Non
                 and len(inner.expressions) == 2 and isinstance(inner.expressions[1], exp.Literal):
             col = _strip(inner.expressions[0])
             f = ctx.field_of(col) if isinstance(col, exp.Column) else None
-            if f is not None and f.agg_field is not None and f.sql_type == "VARCHAR":
+            if f is not None and (f.agg_field is not None or _same_kind_text(f)) and f.sql_type == "VARCHAR":
                 return f, "keyword", inner.expressions[1].this
     return None
 
