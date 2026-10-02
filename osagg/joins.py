@@ -371,10 +371,13 @@ def rewrite_join(select: exp.Select, first: exp.Table, first_meta: Any, joins: l
                 g0 = hit[0].this
         group_exprs.append(g0)
     agg_nodes: list[exp.Expression] = []
+    agg_keys: set[str] = set()         # (each key once: a query of thirty aggregates plans in a blink)
     for part in list(projs) + [select.args.get("having"), select.args.get("order")]:
         if part is not None:
             for a in _aggs_in(part):
-                if _key(a) not in {_key(x) for x in agg_nodes}:
+                key = _key(a)
+                if key not in agg_keys:
+                    agg_keys.add(key)
                     agg_nodes.append(a)
     if not group_exprs and not agg_nodes:
         if not allow_rows:

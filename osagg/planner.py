@@ -162,11 +162,13 @@ def _strip(node: exp.Expression) -> exp.Expression:
 
 def _key(node: exp.Expression) -> str:
     """Structural key used to match identical expressions (qualifiers removed)."""
-    node = _strip(node).copy()
-    for col in node.find_all(exp.Column):
-        col.set("table", None)
-        col.set("db", None)
-        col.set("catalog", None)
+    node = _strip(node)
+    if any(col.args.get("table") or col.args.get("db") or col.args.get("catalog") for col in node.find_all(exp.Column)):
+        node = node.copy()                  # (copied only when there is a qualifier to remove)
+        for col in node.find_all(exp.Column):
+            col.set("table", None)
+            col.set("db", None)
+            col.set("catalog", None)
     return node.sql(dialect="duckdb", normalize=True)
 
 
@@ -960,12 +962,15 @@ class Planner:
 
         # aggregate calls anywhere in the select
         agg_nodes: list[exp.Expression] = []
+        agg_keys: set[str] = set()         # (each key once: a query of thirty aggregates plans in a blink)
         for part in list(select.expressions) + [select.args.get("having"), select.args.get("order"),
                                                 select.args.get("qualify")]:
             if part is None:
                 continue
             for a in _aggs_in(part):
-                if _key(a) not in {_key(x) for x in agg_nodes}:
+                key = _key(a)
+                if key not in agg_keys:
+                    agg_keys.add(key)
                     agg_nodes.append(a)
 
         # group keys

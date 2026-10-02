@@ -186,3 +186,18 @@ def test_document_pages_with_different_column_types_are_concatenated():
     texts = pa.table({"a": pa.array(["n/a"]), "b": pa.array(["w"])})
     t = concat_pages([ints, texts])
     assert t.column("a").to_pylist() == ["1", "2", "n/a"]
+
+
+def test_a_query_of_many_aggregates_plans_in_linear_time(planner, monkeypatch):
+    """Thirty aggregates in one grouped query (a comparison tool reading every measure at once): each one's key is
+    computed a few times, not once per aggregate already seen (0.2.12: about 460 keys for 30 aggregates)."""
+    from osagg import planner as P
+
+    calls = []
+    real = P._key
+    monkeypatch.setattr(P, "_key", lambda node: calls.append(1) or real(node))
+    aggs = ", ".join(f"SUM(\"JOB_DURATION_d\") FILTER (WHERE \"SEVERITY\" = 'S{i}') AS a{i}" for i in range(30))
+    p = plan(planner, f'SELECT "APPLICATION", COUNT(*) AS n, {aggs} FROM jobs GROUP BY "APPLICATION"')
+    assert isinstance(p.scans[0], AggScan) and len(calls) <= 10 * 32      # (0.2.12: more than 700)
+    again = plan(planner, 'SELECT "APPLICATION", COUNT(*) AS n, COUNT(*) AS m, SUM("JOB_DURATION_d") AS s FROM jobs GROUP BY 1')
+    assert isinstance(again.scans[0], AggScan)                      # (the same aggregate twice is still one)

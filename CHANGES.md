@@ -1,5 +1,15 @@
 # Changes
 
+## 0.2.13 — 3 Oct 2026
+
+**A query of many aggregates plans in linear time.** The planner compared each aggregate of a query with every
+aggregate before it, writing both as SQL each time: thirty aggregates in one grouped query (a tool that reads every
+measure of a table at once, each with its own `FILTER (WHERE ...)`) cost about 760 such writings and 100 ms of
+planning, more than OpenSearch took to answer. Each aggregate's key is now computed once per use, and no copy of
+the expression is made when there is no table qualifier to remove: the same query plans in a third of the time,
+and a call of a hundred such queries (supagent 0.9 `compare_groups`) takes 4 to 6 seconds instead of 9 to 10. The
+plans and the results are unchanged.
+
 ## 0.2.12 — 2 Oct 2026
 
 **A fresh Superset 6.1.0 from PyPI needs three pins.** `pip install apache-superset==6.1.0` today pulls Flask-Caching
