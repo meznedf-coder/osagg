@@ -1,5 +1,14 @@
 # Changes
 
+## 0.2.12 — 2 Oct 2026
+
+**A fresh Superset 6.1.0 from PyPI needs three pins.** `pip install apache-superset==6.1.0` today pulls Flask-Caching
+2.5 (Superset 6.1.0 does not start with it), Flask-Limiter 4, which no longer brings `rich` (`superset db upgrade`
+fails), and no `cachetools` (the login page fails). DEPLOY.md, section 2, gives the line
+`pip install "apache-superset==6.1.0" "flask-caching==2.3.1" "flask-limiter<4" cachetools` (tested on an empty
+PostgreSQL database); `install.sh` warns about each one it finds missing. No code change: osagg 0.2.11 and 0.2.12
+read the same.
+
 ## 0.2.11 — 2 Oct 2026
 
 **EXPLAIN names the indices a table reads, and the ones of the same family it misses.** Each table of the query

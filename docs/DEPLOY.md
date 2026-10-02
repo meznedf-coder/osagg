@@ -119,11 +119,12 @@ you start them (systemd units, supervisor, or the `gunicorn` / `celery` commands
 Install it everywhere Superset runs queries: the web server and every Celery worker
 (alerts, reports, async SQL Lab). Repeat step 2 on each host if they are separate.
 
-**Fresh pip install of Superset 6.1.0:** `pip install apache-superset==6.1.0` now pulls
-Flask-Caching 2.5.1, with which Superset 6.1.0 does not start (`SupersetMetastoreCache.__init__()
-got an unexpected keyword argument 'ignore_delete_many_errors'`). Pin it:
-`pip install "apache-superset==6.1.0" "flask-caching==2.3.1"` (tested 27 Sep 2026; `install.sh`
-prints a warning when it finds 2.5 or later). Existing installations are not affected.
+**Fresh pip install of Superset 6.1.0:** `pip install apache-superset==6.1.0` now pulls three packages with which
+Superset 6.1.0 does not start: Flask-Caching 2.5 (`SupersetMetastoreCache.__init__() got an unexpected keyword
+argument 'ignore_delete_many_errors'`), Flask-Limiter 4, which no longer brings `rich` (`superset db upgrade`:
+`No module named 'rich'`), and no `cachetools` (the login page: `No module named 'cachetools'`). Pin them:
+`pip install "apache-superset==6.1.0" "flask-caching==2.3.1" "flask-limiter<4" cachetools` (tested 2 Oct 2026 on
+an empty PostgreSQL database; `install.sh` prints a warning for each). Existing installations are not affected.
 
 ## 3. `superset_config.py`
 
